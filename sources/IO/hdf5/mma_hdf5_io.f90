@@ -178,6 +178,11 @@ contains
     call h5awrite_f(attr_id, H5T_NEKO_REAL, object%epsimin, ddim, ierr)
     call h5aclose_f(attr_id, ierr)
 
+    call h5acreate_f(grp_id, 'move_limit', H5T_NEKO_REAL, filespace, attr_id, &
+         ierr, h5p_default_f, h5p_default_f)
+    call h5awrite_f(attr_id, H5T_NEKO_REAL, object%move_limit, ddim, ierr)
+    call h5aclose_f(attr_id, ierr)
+
     ! String-valued attributes
 
     ! Create the string type
@@ -224,6 +229,7 @@ contains
     call h5dcreate_f(grp_id, 'a0', H5T_NEKO_REAL, filespace, dset_id, ierr)
     call h5dwrite_f(dset_id, H5T_NEKO_REAL, object%a0, ddim, ierr)
     call h5dclose_f(dset_id, ierr)
+    call h5sclose_f(filespace, ierr)
 
     ! The next batch are vectors of size m
     ddim(1) = object%m
@@ -340,7 +346,8 @@ contains
     integer(hsize_t), dimension(1) :: ddim, dcount, doffset
     integer :: ierr, info, mpi_comm
     integer :: n, n_global, m, max_iter, n_accum, n_array(pe_size)
-    real(kind=rp) :: asyinit, asyincr, asydecr, epsimin
+    real(kind=rp) :: asyinit, asyincr, asydecr, epsimin, move_limit
+    logical :: move_limit_exists
 
     character(len=*), parameter :: h5_group = '/MMA/checkpoint'
     character(len=12) :: bcknd, subsolver
@@ -353,6 +360,7 @@ contains
     asyincr = -1.0_rp
     asydecr = -1.0_rp
     epsimin = -1.0_rp
+    move_limit = object%move_limit
 
     bcknd = ''
     subsolver = ''
@@ -417,18 +425,26 @@ contains
     call h5aread_f(attr_id, H5T_NEKO_REAL, epsimin, ddim, ierr)
     call h5aclose_f(attr_id, ierr)
 
+    move_limit_exists = .false.
+    call h5aexists_f(grp_id, 'move_limit', move_limit_exists, ierr)
+    if (move_limit_exists) then
+       call h5aopen_f(grp_id, 'move_limit', attr_id, ierr)
+       call h5aread_f(attr_id, H5T_NEKO_REAL, move_limit, ddim, ierr)
+       call h5aclose_f(attr_id, ierr)
+    end if
+
     ! Read strings
     call h5aopen_f(grp_id, 'bcknd', attr_id, ierr)
     call h5aget_type_f(attr_id, str_type, ierr)
     call h5aread_f(attr_id, str_type, bcknd, ddim, ierr)
+    call h5tclose_f(str_type, ierr)
     call h5aclose_f(attr_id, ierr)
 
     call h5aopen_f(grp_id, 'subsolver', attr_id, ierr)
     call h5aget_type_f(attr_id, str_type, ierr)
     call h5aread_f(attr_id, str_type, subsolver, ddim, ierr)
-    call h5aclose_f(attr_id, ierr)
-
     call h5tclose_f(str_type, ierr)
+    call h5aclose_f(attr_id, ierr)
 
     ! Read array attribute n
     ddim(1) = pe_size
@@ -464,6 +480,11 @@ contains
     end if
     if (.not. abscmp(epsimin, object%epsimin)) then
        call neko_error('mma: mismatch in epsimin during HDF5 read')
+    end if
+    if (move_limit_exists) then
+       if (.not. abscmp(move_limit, object%move_limit)) then
+          call neko_error('mma: mismatch in move_limit during HDF5 read')
+       end if
     end if
     if (trim(bcknd) .ne. trim(object%bcknd)) then
        call neko_error('mma: mismatch in bcknd during HDF5 read')

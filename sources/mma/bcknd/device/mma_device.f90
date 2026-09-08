@@ -37,7 +37,7 @@ submodule (mma) mma_device
   use device_math, only: device_copy, device_cmult, device_cadd, device_cfill, &
        device_add2, device_add3s2, device_invcol2, device_col2, device_col3, &
        device_sub2, device_sub3, device_add2s2, device_cadd2, device_pwmax2, &
-       device_glsum, device_cmult2
+       device_pwmin2, device_cpwmax2, device_glsum, device_cmult2
   use device_mma_math, only: device_maxval, device_norm, device_lcsc2, &
        device_maxval2, device_maxval3, device_mma_gensub3, &
        device_mma_gensub4, device_mma_max, device_max2, device_rex, &
@@ -84,8 +84,8 @@ contains
     call profiler_start_region("MMA subsolve")
     if (this%subsolver .eq. "dip") then
        call mma_subsolve_dip_device(this, x)
-    else if (this%subsolver .eq. "dpip") then
-       call mma_subsolve_dpip_device(this, x)
+    else if (this%subsolver .eq. "pdip") then
+       call mma_subsolve_pdip_device(this, x)
     else
        call neko_error("Unrecognized subsolver for MMA in mma_device.")
     end if
@@ -100,8 +100,10 @@ contains
 
     if (this%subsolver .eq. "dip") then
        call mma_dip_KKT_device(this, x, df0dx, fval, dfdx)
+    else if (this%subsolver .eq. "pdip") then
+       call mma_pdip_KKT_device(this, x, df0dx, fval, dfdx)
     else
-       call mma_dpip_KKT_device(this, x, df0dx, fval, dfdx)
+       call neko_error("Unrecognized subsolver for MMA in mma_device.")
     end if
   end subroutine mma_KKT_device
 
@@ -135,8 +137,8 @@ contains
   end subroutine mma_dip_KKT_device
 
   !> Implementation of the KKT residual computation for dual primal interior
-  ! point method (dpip) subsolve of MMA algorithm.
-  module subroutine mma_dpip_KKT_device(this, x, df0dx, fval, dfdx)
+  ! point method (pdip) subsolve of MMA algorithm.
+  module subroutine mma_pdip_KKT_device(this, x, df0dx, fval, dfdx)
     class(mma_t), intent(inout) :: this
     type(c_ptr), intent(in) :: x, df0dx, fval, dfdx
 
@@ -214,7 +216,7 @@ contains
          ) + re_sq_norm)
 
     call this%scratch%relinquish(ind)
-  end subroutine mma_dpip_KKT_device
+  end subroutine mma_pdip_KKT_device
 
   !============================================================================!
   ! private internal subroutines
@@ -235,12 +237,26 @@ contains
     integer, intent(in) :: iter
     integer :: ierr
 
-    type(vector_t), pointer :: x_diff
-    integer :: ind
+    type(vector_t), pointer :: x_diff, xmin_eff, xmax_eff
+    integer :: ind(3)
 
-    call this%scratch%request(x_diff, ind, this%n, .false.)
+    call this%scratch%request(x_diff, ind(1), this%n, .false.)
+    call this%scratch%request(xmin_eff, ind(2), this%n, .false.)
+    call this%scratch%request(xmax_eff, ind(3), this%n, .false.)
 
-    call device_sub3(x_diff%x_d, this%xmax%x_d, this%xmin%x_d, this%n)
+    call device_copy(xmin_eff%x_d, this%xmin%x_d, this%n)
+    call device_copy(xmax_eff%x_d, this%xmax%x_d, this%n)
+
+    if (this%move_limit .gt. 0.0_rp) then
+       call device_cadd2(xmin_eff%x_d, x, -this%move_limit, this%n)
+       call device_pwmax2(xmin_eff%x_d, this%xmin%x_d, this%n)
+
+       call device_cadd2(xmax_eff%x_d, x, this%move_limit, this%n)
+       call device_pwmin2(xmax_eff%x_d, this%xmax%x_d, this%n)
+    end if
+
+    call device_sub3(x_diff%x_d, xmax_eff%x_d, xmin_eff%x_d, this%n)
+    call device_cpwmax2(x_diff%x_d, 1.0e-5_rp, this%n)
 
     ! ------------------------------------------------------------------------ !
     ! Setup the current asymptotes
@@ -260,7 +276,7 @@ contains
     ! Calculate p0j, q0j, pij, qij, alpha, and beta
 
     call device_mma_gensub3(x, df0dx, dfdx, this%low%x_d, &
-         this%upp%x_d, this%xmin%x_d, this%xmax%x_d, this%alpha%x_d, &
+         this%upp%x_d, xmin_eff%x_d, xmax_eff%x_d, this%alpha%x_d, &
          this%beta%x_d, this%p0j%x_d, this%q0j%x_d, this%pij%x_d, &
          this%qij%x_d, this%n, this%m)
 
@@ -284,7 +300,7 @@ contains
 
   !> solve the subproblem defined by this%pij, this%qij, etc. using dual-primal
   !! interior point method
-  subroutine mma_subsolve_dpip_device(this, designx_d)
+  subroutine mma_subsolve_pdip_device(this, designx_d)
     class(mma_t), intent(inout) :: this
     type(c_ptr), intent(in) :: designx_d
     integer :: iter, itto, ierr
@@ -549,7 +565,7 @@ contains
           call device_solve_linear_system(AA%x_d, bb%x_d, this%m + 1, info)
           if (info .ne. 0) then
              call neko_error("Linear solver failed on the device in  " // &
-                  "mma_subsolve_dpip")
+                  "mma_subsolve_pdip")
           end if
 
           call device_copy(dlambda%x_d, bb%x_d, this%m)
@@ -747,7 +763,7 @@ contains
 
     !free all the initiated variables in this subroutine
     call this%scratch%relinquish(ind)
-  end subroutine mma_subsolve_dpip_device
+  end subroutine mma_subsolve_pdip_device
 
   !> solve the subproblem defined by this%pij, this%qij, etc. using dual
   !! interior point method
