@@ -1,0 +1,117 @@
+{
+    "version": 1.0,
+    "case": {
+        "mesh_file": "mesh/alm.nmsh",
+        "output_directory": "output",
+        "output_boundary": false,
+        "output_checkpoints": false,
+        "output_at_end": false,
+        "time": {
+            "end_time": 10.0,
+            "timestep": 1e-2,
+            "variable_timestep": true,
+            "target_cfl": 0.4
+        },
+        "numerics": {
+            "time_order": 3,
+            "polynomial_order": 5,
+            "dealias": false
+        },
+        "adjoint_fluid": {
+            "initial_condition": {
+                "type": "uniform",
+                "value": [ 0.0, 0.0, 0.0 ]
+            },
+            "boundary_conditions": [
+                {
+                    "type": "velocity_value",
+                    "zone_indices": [ 1 ],
+		            "value": [ 1.0, 0.0, 0.0 ]
+                },
+                {
+                    "type": "outflow",
+                    "zone_indices": [ 2 ]
+                }
+            ]
+        },
+        "fluid": {
+            "scheme": "pnpn",
+            "Re": 1e3,
+            "gamma": 1.4,
+            "initial_condition": {
+                "type": "uniform",
+                "value": [ 1.0, 0.0, 0.0 ]
+            }, 
+            "velocity_solver": {
+                "type": "coupled_cg",
+                "preconditioner": {
+                    "type": "jacobi"
+                },
+                "projection_space_size": 0,
+                "absolute_tolerance": 1e-7,
+                "max_iterations": 800
+            },
+            "pressure_solver": {
+                "type": "gmres",
+                "preconditioner": {
+                    "type": "hsmg"
+                },
+                "projection_space_size": 8,
+                "absolute_tolerance": 1e-7,
+                "max_iterations": 800
+            },
+            "boundary_conditions": [
+                {
+                    "type": "velocity_value",
+                    "zone_indices": [ 1 ],
+		            "value": [ 1.0, 0.0, 0.0 ]
+                },
+                {
+                    "type": "outflow",
+                    "zone_indices": [ 2 ]
+                }
+            ],
+	        "output_control": "simulationtime",
+            "output_value": 1000.0
+        }
+    },
+    "optimization": {
+        "design": {
+            "type": "actuator_line",
+            "N": 10,
+            "b": 2.0,
+            "AR": 10.0,
+            "eps": 0.25,
+            "xcenter": 0.0,
+            "ycenter": 0.0,
+            "zcenter": 0.0
+        },
+        "solver": {
+            "type": "mma",
+            "max_iterations": 5,
+            "tolerance": 1.0e-3,
+            "mma": {
+                "max_iter": 100,
+                "asyinit": 0.5,
+                "asyincr": 1.2,
+                "asydecr": 0.7,
+                "scale": 1.0,
+                "auto_scale": false,
+                "xmin": 0.0,
+                "xmax": 1.0,
+                "a0": 1.0,
+                "a": 0.0,
+                "c": 1000.0,
+                "d": 10.0
+            }
+        },
+        "objectives": [
+            {
+                "type": "actuator_line",
+                "weight": 1.0,
+                "lift_penalty_weight": 100.0,
+                "CL_target": 0.5
+            }
+        ]
+    }
+}

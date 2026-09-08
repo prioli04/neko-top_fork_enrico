@@ -17,4 +17,5 @@ target_sources(neko-top
         ${CMAKE_CURRENT_SOURCE_DIR}/design_types/design_simple.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/design_types/design_simplefield.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/design_types/design_3dto1d.f90
+        ${CMAKE_CURRENT_SOURCE_DIR}/design_types/design_actuator_line.f90
 )

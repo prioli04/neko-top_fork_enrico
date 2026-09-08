@@ -41,6 +41,7 @@ endif()
 # ============================================================================ #
 # Add the example directories.
 
+add_subdirectory(${EXAMPLES_DIR}/alm)
 add_subdirectory(${EXAMPLES_DIR}/easy-E)
 add_subdirectory(${EXAMPLES_DIR}/mma)
 add_subdirectory(${EXAMPLES_DIR}/passive_scalar)

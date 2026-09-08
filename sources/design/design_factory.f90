@@ -40,13 +40,15 @@ submodule (design) design_factory_mod
   ! Import the design function types
   use brinkman_design, only: brinkman_design_t
   use simple_design, only: simple_design_t
+  use actuator_line_design, only: actuator_line_design_t
 
   implicit none
 
   !> Known function types
-  character(len=25), parameter :: KNOWN_TYPES(2) = [ character(len=25) :: &
+  character(len=25), parameter :: KNOWN_TYPES(3) = [ character(len=25) :: &
        "brinkman", &
-       "simple"]
+       "simple", &
+       "actuator_line"]
 
 contains
 
@@ -76,7 +78,8 @@ contains
        allocate(brinkman_design_t::object)
     case ("simple")
        allocate(simple_design_t::object)
-
+    case ("actuator_line")
+       allocate(actuator_line_design_t::object)
     case default
        call neko_type_error("design", type, KNOWN_TYPES)
     end select
