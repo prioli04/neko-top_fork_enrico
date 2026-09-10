@@ -343,8 +343,10 @@ contains
     class(simulation_t), intent(inout) :: this
     type(time_step_controller_t) :: dt_controller
     real(kind=dp) :: loop_start
+    type(json_file) :: time_params
 
-    call dt_controller%init(this%neko_case%params)
+    call json_get(this%neko_case%params, 'case.time', time_params)
+    call dt_controller%init(time_params)
 
     call this%neko_case%time%reset()
     call simulation_init(this%neko_case, dt_controller)

@@ -511,9 +511,11 @@ contains
     class(design_t), intent(inout) :: design
     type(time_step_controller_t) :: dt_controller
     real(kind=dp) :: loop_start
+    type(json_file) :: time_params
 
-    call dt_controller%init(simulation%neko_case%params)
-
+    call json_get(simulation%neko_case%params, 'case.time', time_params)
+    call dt_controller%init(time_params)
+    
     call simulation%reset()
     call simulation_init(simulation%neko_case, dt_controller)
 
