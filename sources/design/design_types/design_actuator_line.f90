@@ -81,8 +81,8 @@ module actuator_line_design
      !> Initialize the design from components
      procedure, pass(this), public :: init_from_components => &
           actuator_line_design_init_from_components
-     !> Retrieve lift and drag coefficients
-     procedure, pass(this), public :: get_coefficients => actuator_line_design_get_coefficients
+     !> Retrieve lift and drag
+     procedure, pass(this), public :: get_resultant_force => actuator_line_design_get_resultant_force
      !> Retrieve the design variables
      procedure, pass(this) :: get_values => actuator_line_design_get_design
      !> Retrieve the sensitivity
@@ -114,11 +114,12 @@ contains
     character(len=:), allocatable :: name
 
     integer :: N
-    real(kind=rp) :: CL, b, AR, eps, x_center, y_center, z_center
+    real(kind=rp) :: CL, V_inf, b, AR, eps, x_center, y_center, z_center
     real(kind=rp), allocatable :: gamm(:)
 
     call json_get_or_default(parameters, 'name', name, 'Actuator Line Design')
     call json_get(parameters, "N", N)
+    call json_get(parameters, "V_inf", V_inf)
     call json_get(parameters, 'b', b)
     call json_get(parameters, 'AR', AR)
     call json_get(parameters, 'eps', eps)
@@ -128,8 +129,8 @@ contains
     call json_get(parameters, 'gamma', gamm)
     
     ! Initialize and inject into the simulation
-    call this%init_from_components(name, simulation, N, b, AR, eps, &
-        x_center, y_center, z_center)
+    call this%init_from_components(name, simulation, N, V_inf, b, AR, eps, &
+        x_center, y_center, z_center, gamm)
 
   end subroutine actuator_line_design_init_from_json_sim
 
@@ -137,22 +138,21 @@ contains
   subroutine actuator_line_design_free(this)
     class(actuator_line_design_t), intent(inout) :: this
 
-    if (allocated(this%gamm)) then
-      deallocate(this%gamm)
-    end if
     if (allocated(this%sensitivity)) then
       deallocate(this%sensitivity)
     end if
+    nullify(this%gamma_vec)
     call this%free_base()
 
   end subroutine actuator_line_design_free
 
-  subroutine actuator_line_design_init_from_components(this, name, simulation, N, b, AR, eps, &
+  subroutine actuator_line_design_init_from_components(this, name, simulation, N, V_inf, b, AR, eps, &
         x_center, y_center, z_center, gamm)
     class(actuator_line_design_t), target, intent(inout) :: this
     character(len=*), intent(in) :: name
     type(simulation_t), intent(inout) :: simulation
     integer, intent(in) :: N
+    real(kind=rp), intent(in) :: V_inf
     real(kind=rp), intent(in) :: b
     real(kind=rp), intent(in) :: AR
     real(kind=rp), intent(in) :: eps
@@ -179,7 +179,7 @@ contains
 
     ! Init the actuator line term for the forward problem
     call forward_source%init_from_compenents(fields_forward, simulation%fluid%c_Xh, &
-         N, 1.0_rp, b, AR, eps, x_center, y_center, z_center, gamm, this%interpolator, this%alm_id)
+         N, 1.0_rp, V_inf, b, AR, eps, x_center, y_center, z_center, gamm, this%interpolator, this%alm_id)
     
     write(gamma_name, '("alm_", A, "_", I0)') "gamma", this%alm_id
     this%gamma_vec => neko_registry%get_vector(trim(gamma_name))
@@ -194,14 +194,7 @@ contains
     call fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
 
     ! Init the actuator line term for the adjoint
-    call adjoint_source%init_from_components(fields_adjoint, this%brinkman_amplitude, &
-         simulation%adjoint_fluid%u_adj, &
-         simulation%adjoint_fluid%v_adj, &
-         simulation%adjoint_fluid%w_adj, &
-         simulation%adjoint_fluid%c_Xh, &
-         simulation%adjoint_fluid%c_Xh_GL, &
-         simulation%adjoint_fluid%GLL_to_GL, &
-         dealias, simulation%adjoint_fluid%scratch_GL)
+    call adjoint_source%init_from_components(fields_adjoint, simulation%adjoint_fluid%c_Xh, this%gamma_vec)
          
     ! ! Append source term to the adjoint problem
     ! select type (f => simulation%adjoint_fluid)
@@ -241,21 +234,21 @@ contains
 
   end subroutine actuator_line_design_get_sensitivity
 
-  subroutine actuator_line_design_get_coefficients(this, CL, CD)
+  subroutine actuator_line_design_get_resultant_force(this, lift, drag)
     class(actuator_line_design_t), intent(in) :: this
-    real(kind=rp), intent(out) :: CL
-    real(kind=rp), intent(out) :: CD
+    real(kind=rp), intent(out) :: lift
+    real(kind=rp), intent(out) :: drag
 
-    character(len=64) :: coefs_name
-    type(vector_t), pointer :: coefs
+    character(len=64) :: resultant_force_name
+    type(vector_t), pointer :: resultant_force
 
-    write(coefs_name, '("alm_", A, "_", I0)') "coefs", this%alm_id
-    coefs => neko_registry%get_vector(trim(coefs_name))
+    write(resultant_force_name, '("alm_", A, "_", I0)') "resultant_force", this%alm_id
+    resultant_force => neko_registry%get_vector(trim(resultant_force_name))
 
-    CL = coefs%x(1)
-    CD = coefs%x(2)
+    lift = resultant_force%x(1)
+    drag = resultant_force%x(2)
 
-  end subroutine actuator_line_design_get_coefficients
+  end subroutine actuator_line_design_get_resultant_force
   
   subroutine actuator_line_design_get_x(this, x)
     class(actuator_line_design_t), intent(in) :: this

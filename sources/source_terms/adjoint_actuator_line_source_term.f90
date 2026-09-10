@@ -60,7 +60,7 @@ module adjoint_actuator_line_source_term
      !> The lift deviation.
      real(kind=rp) :: delta_L
      !> The penalty factor for the lift deviation.
-     real(kind=rp) :: beta
+     real(kind=rp), pointer :: beta
 
    contains
      !> The common constructor using a JSON object.
@@ -106,27 +106,30 @@ contains
   !! @param beta The penalty factor for the lift deviation
   !! @param delta_L The lift deviation
   !! @param gamma_vec The design circulation vector
-  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, beta, delta_L, gamma_vec)
+  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, gamma_vec)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
-    real(kind=rp), intent(in) :: beta
-    real(kind=rp), intent(in) :: delta_L
     type(vector_t), pointer, intent(in) :: gamma_vec
 
-    real(kind=rp) :: start_time, end_time
+    real(kind=rp), pointer :: CL_target
+    real(kind=rp) :: start_time, end_time, delta_CL
 
     ! Mandatory parameters for the general source term
     start_time = 0.0_rp
     end_time = huge(0.0_rp)
 
     call this%init_base(fields, coef, start_time, end_time)
-    call fields%free()
 
     ! Point everything in the correct places
     this%gamma_vec => gamma_vec
-    this%delta_L = delta_L
-    this%beta = beta
+    this%beta => neko_registry%get_real_scalar("alm_lift_penalty_weight")
+
+    ! Compute lift deviation
+    CL_target => neko_registry%get_real_scalar("alm_CL_target")
+
+
+    delta_CL =  - CL_target
 
   end subroutine adjoint_actuator_line_source_term_init_from_components
 

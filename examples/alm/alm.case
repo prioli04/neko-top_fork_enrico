@@ -14,7 +14,7 @@
         },
         "numerics": {
             "time_order": 3,
-            "polynomial_order": 5,
+            "polynomial_order": 3,
             "dealias": false
         },
         "adjoint_fluid": {
@@ -79,12 +79,14 @@
         "design": {
             "type": "actuator_line",
             "N": 10,
+            "V_inf": 1.0,
             "b": 2.0,
             "AR": 10.0,
-            "eps": 0.25,
+            "eps": 1.0,
             "xcenter": 0.0,
             "ycenter": 0.0,
-            "zcenter": 0.0
+            "zcenter": 0.0,
+            "gamma": [0.02775, 0.04546, 0.05513, 0.06073, 0.06334, 0.06334, 0.06073, 0.05513, 0.04546, 0.02775]
         },
         "solver": {
             "type": "mma",
