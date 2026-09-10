@@ -78,30 +78,10 @@ module actuator_line_objective
      type(field_t), pointer :: w => null()
      !> Circulation distribution.
      type(vector_t) :: gamm
-     !> volume of objective domain
-     real(kind=rp) :: volume
      !> weight of the lift deviation penalty term
      real(kind=rp) :: lift_penalty_weight
      !> target lift coefficient
      real(kind=rp) :: CL_target
-
-     ! ---- everything GLL ----
-     !> The coefs
-     type(coef_t), pointer :: c_Xh_GLL
-     !> The original space used in the simulation
-     type(space_t), pointer :: Xh_GLL
-
-     ! ---- everything for GL ----
-     !> The additional higher-order space used in dealiasing
-     type(space_t), pointer :: Xh_GL
-     !> coefs of the higher-order space
-     type(coef_t), pointer :: c_Xh_GL
-     !> Interpolator between the original and higher-order spaces
-     type(interpolator_t), pointer :: GLL_to_GL
-     !> GL scratch registry
-     type(scratch_registry_t), pointer :: scratch_GL
-     !> Physical dimension
-     integer :: gdim
 
    contains
 
@@ -135,48 +115,35 @@ contains
     class(design_t), intent(in) :: design
     type(simulation_t), target, intent(inout) :: simulation
 
-    character(len=:), allocatable :: mask_name
     character(len=:), allocatable :: name
     real(kind=rp) :: weight
-    real(kind=rp) :: start_time, end_time
 
     call nekotop_continuation%json_get_or_register(json, 'weight', this%weight, weight, 1.0_rp)
     call json_get_or_default(json, "lift_penalty_weight", this%lift_penalty_weight, 1.0_rp)
     call json_get_or_default(json, "CL_target", this%CL_target, 1.0_rp)
-    call json_get_or_default(json, "mask_name", mask_name, "")
     call json_get_or_default(json, "name", name, "Actuator Line")
-    call json_get_or_default(json, "start_time", start_time, 0.0_rp)
-    call json_get_or_default(json, "end_time", end_time, huge(0.0_rp))
 
-    call this%init_from_attributes(design, simulation, weight, name, &
-         mask_name, start_time, end_time)
+    call this%init_from_attributes(design, simulation, weight, name)
   end subroutine actuator_line_init_json_sim
 
   !> The actual constructor.
   !! @param this The objective.
-  !! @param design] the design.
+  !! @param design the design.
   !! @param simulation the simulation.
   !! @param weight the weight of the objective function.
   !! @param name the name of the objective.
-  !! @param mask_name the name of the mask.
-  !! @param start_time start of the integration window.
-  !! @param end_time end of the integration window.
   subroutine actuator_line_init_attributes(this, design, simulation, &
-       weight, name, mask_name, start_time, end_time)
+       weight, name)
     class(actuator_line_objective_t), intent(inout) :: this
     class(design_t), intent(in) :: design
     type(simulation_t), target, intent(inout) :: simulation
     real(kind=rp), intent(in) :: weight
     character(len=*), intent(in) :: name
-    character(len=*), intent(in) :: mask_name
-    real(kind=rp), intent(in) :: start_time
-    real(kind=rp), intent(in) :: end_time
-
+    
     type(adjoint_actuator_line_source_term_t) :: actuator_line_adjoint_source
 
     ! Call the base initializer
-    call this%init_base(name, design%size(), weight, mask_name, &
-         start_time, end_time)
+    call this%init_base(name, design%size(), weight)
 
     ! Get the circulation distribution
     call this%gamm%init(design%size())
@@ -194,20 +161,6 @@ contains
     this%v => neko_registry%get_field('v')
     this%w => neko_registry%get_field('w')
 
-    ! GLL
-    this%c_Xh_GLL => simulation%neko_case%fluid%c_Xh
-    this%Xh_GLL => simulation%neko_case%fluid%c_Xh%Xh
-    this%gdim = this%c_Xh_GLL%msh%gdim
-
-    ! GL
-    this%c_Xh_GL => simulation%adjoint_case%fluid_adj%c_Xh_GL
-    this%Xh_GL => this%c_Xh_GL%Xh
-
-    ! GLL to GL
-    this%GLL_to_GL => simulation%adjoint_case%fluid_adj%GLL_to_GL
-
-    this%scratch_GL => simulation%adjoint_case%fluid_adj%scratch_GL
-
   end subroutine actuator_line_init_attributes
 
   !> Destructor.
@@ -216,12 +169,6 @@ contains
     this%u => null()
     this%v => null()
     this%w => null()
-    this%c_Xh_GLL => null()
-    nullify(this%c_Xh_GL)
-    nullify(this%Xh_GL)
-    nullify(this%Xh_GLL)
-    nullify(this%GLL_to_GL)
-    nullify(this%scratch_GL)
     call this%gamm%free()
     call this%free_base()
 

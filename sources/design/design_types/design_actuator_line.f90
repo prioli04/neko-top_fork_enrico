@@ -60,7 +60,7 @@ module actuator_line_design
      private
 
      !> Vector of circulations (the design variables)
-     real(kind=rp), allocatable :: gamm(:)
+     type(vector_t), pointer :: gamma_vec => null()
      !> Vector of sensitivities (dJ/dGamma)
      real(kind=rp), allocatable :: sensitivity(:)
      !> Global interpolation object
@@ -115,6 +115,7 @@ contains
 
     integer :: N
     real(kind=rp) :: CL, b, AR, eps, x_center, y_center, z_center
+    real(kind=rp), allocatable :: gamm(:)
 
     call json_get_or_default(parameters, 'name', name, 'Actuator Line Design')
     call json_get(parameters, "N", N)
@@ -124,11 +125,8 @@ contains
     call json_get(parameters, 'xcenter', x_center)
     call json_get(parameters, 'ycenter', y_center)
     call json_get(parameters, 'zcenter', z_center)
-    call json_get(parameters, 'gamma', this%gamm)
+    call json_get(parameters, 'gamma', gamm)
     
-    ! allocate(this%gamm(N))
-    ! this%gamm = 1.0_rp
-
     ! Initialize and inject into the simulation
     call this%init_from_components(name, simulation, N, b, AR, eps, &
         x_center, y_center, z_center)
@@ -150,7 +148,7 @@ contains
   end subroutine actuator_line_design_free
 
   subroutine actuator_line_design_init_from_components(this, name, simulation, N, b, AR, eps, &
-        x_center, y_center, z_center)
+        x_center, y_center, z_center, gamm)
     class(actuator_line_design_t), target, intent(inout) :: this
     character(len=*), intent(in) :: name
     type(simulation_t), intent(inout) :: simulation
@@ -161,42 +159,49 @@ contains
     real(kind=rp), intent(in) :: x_center
     real(kind=rp), intent(in) :: y_center
     real(kind=rp), intent(in) :: z_center
+    real(kind=rp), intent(in) :: gamm(:)
 
-    type(actuator_line_source_term_t), target :: forward_source
+    type(actuator_line_source_term_t) :: forward_source
     type(adjoint_actuator_line_source_term_t) :: adjoint_source
-    type(field_list_t) :: fields
+    type(field_list_t) :: fields_forward, fields_adjoint
+    character(len=64) :: gamma_name
 
     call this%init_base(name, N)
 
     ! Init list of source fields used for initializing Neko's sources
-    call fields%init(3)
-    call fields%assign(1, simulation%fluid%f_x)
-    call fields%assign(2, simulation%fluid%f_y)
-    call fields%assign(3, simulation%fluid%f_z)
+    call fields_forward%init(3)
+    call fields_forward%assign(1, simulation%fluid%f_x)
+    call fields_forward%assign(2, simulation%fluid%f_y)
+    call fields_forward%assign(3, simulation%fluid%f_z)
 
     ! Init interpolator
     call this%interpolator%init(simulation%fluid%u%dof)
 
     ! Init the actuator line term for the forward problem
-    call forward_source%init_from_compenents(fields, simulation%fluid%c_Xh, &
-         N, 1.0_rp, b, AR, eps, x_center, y_center, z_center, this%gamm, this%interpolator, this%alm_id)
+    call forward_source%init_from_compenents(fields_forward, simulation%fluid%c_Xh, &
+         N, 1.0_rp, b, AR, eps, x_center, y_center, z_center, gamm, this%interpolator, this%alm_id)
     
+    write(gamma_name, '("alm_", A, "_", I0)') "gamma", this%alm_id
+    this%gamma_vec => neko_registry%get_vector(trim(gamma_name))
+
     ! Append source term to the forward problem
     call simulation%fluid%source_term%add(forward_source)
 
+    ! Init list of source fields used for initializing the adjoint source
+    call fields_adjoint%init(3)
+    call fields_adjoint%assign(1, simulation%adjoint_fluid%f_adj_x)
+    call fields_adjoint%assign(2, simulation%adjoint_fluid%f_adj_y)
+    call fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
+
     ! Init the actuator line term for the adjoint
-    ! call adjoint_source%init_from_components( &
-    !      simulation%adjoint_fluid%f_adj_x, &
-    !      simulation%adjoint_fluid%f_adj_y, &
-    !      simulation%adjoint_fluid%f_adj_z, &
-    !      this%brinkman_amplitude, &
-    !      simulation%adjoint_fluid%u_adj, &
-    !      simulation%adjoint_fluid%v_adj, &
-    !      simulation%adjoint_fluid%w_adj, &
-    !      simulation%adjoint_fluid%c_Xh, &
-    !      simulation%adjoint_fluid%c_Xh_GL, &
-    !      simulation%adjoint_fluid%GLL_to_GL, &
-    !      dealias, simulation%adjoint_fluid%scratch_GL)
+    call adjoint_source%init_from_components(fields_adjoint, this%brinkman_amplitude, &
+         simulation%adjoint_fluid%u_adj, &
+         simulation%adjoint_fluid%v_adj, &
+         simulation%adjoint_fluid%w_adj, &
+         simulation%adjoint_fluid%c_Xh, &
+         simulation%adjoint_fluid%c_Xh_GL, &
+         simulation%adjoint_fluid%GLL_to_GL, &
+         dealias, simulation%adjoint_fluid%scratch_GL)
          
     ! ! Append source term to the adjoint problem
     ! select type (f => simulation%adjoint_fluid)
@@ -216,11 +221,11 @@ contains
     class(actuator_line_design_t), intent(in) :: this
     type(vector_t), intent(inout) :: values
 
-    if (size(this%gamm) .ne. values%size()) then
+    if (size(this%gamma_vec%x) .ne. values%size()) then
        call neko_error('Get design: size mismatch')
     end if
 
-    call copy(values%x, this%gamm, size(this%gamm))
+    call copy(values%x, this%gamma_vec%x, size(this%gamma_vec%x))
 
   end subroutine actuator_line_design_get_design
 
@@ -228,11 +233,11 @@ contains
     class(actuator_line_design_t), intent(in) :: this
     type(vector_t), intent(inout) :: values
 
-    if (size(this%gamm) .ne. values%size()) then
+    if (size(this%gamma_vec%x) .ne. values%size()) then
        call neko_error('Get sensitivity: size mismatch')
     end if
 
-    call copy(values%x, this%sensitivity, size(this%gamm))
+    call copy(values%x, this%sensitivity, size(this%gamma_vec%x))
 
   end subroutine actuator_line_design_get_sensitivity
 
@@ -293,10 +298,10 @@ contains
     type(vector_t), intent(inout) :: values
     
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_memcpy(values%x, values%x_d, size(this%gamm), DEVICE_TO_HOST, .true.)
+       call device_memcpy(values%x, values%x_d, size(this%gamma_vec%x), DEVICE_TO_HOST, .true.)
     end if
 
-    call copy(this%gamm, values%x, size(this%gamm))
+    call copy(this%gamma_vec%x, values%x, size(this%gamma_vec%x))
 
   end subroutine actuator_line_design_update_design
 
@@ -313,7 +318,7 @@ contains
     integer, intent(in) :: idx
 
     print *, "actuator_line_design_write"
-    print *, this%gamm
+    print *, this%gamma_vec%x
 
   end subroutine actuator_line_design_write
 

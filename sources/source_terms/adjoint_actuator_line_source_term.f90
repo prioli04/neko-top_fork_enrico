@@ -44,6 +44,8 @@ module adjoint_actuator_line_source_term
   use json_utils, only: json_get, json_get_or_default
   use source_term, only : source_term_t
   use coefs, only : coef_t
+  use vector, only: vector_t
+  use math, only : rzero, add2s2, vcross
   use field_math, only: field_add2s2, field_copy, field_cadd
   use mask_ops, only: mask_exterior_const, compute_masked_volume
   use point_zone, only: point_zone_t
@@ -52,18 +54,14 @@ module adjoint_actuator_line_source_term
   public :: adjoint_actuator_line_source_term_allocate
 
   type, public, extends(source_term_t) :: adjoint_actuator_line_source_term_t
-     !> The forward scalar field
-     type(field_t), pointer :: s => null()
-     !> A scalaing factor
-     real(kind=rp) :: obj_scale
-     !> Reference concentration
-     real(kind=rp) :: phi_ref
-     !> A mask for where the source term is evaluated
-     class(point_zone_t), pointer :: mask => null()
-     !> containing a mask?
-     logical :: if_mask
-     !> The volume of the masked region (or whole domain)
-     real(kind=rp) :: mask_volume
+
+     !> The circulation distribution.
+     type(vector_t), pointer :: gamma_vec => null()
+     !> The lift deviation.
+     real(kind=rp) :: delta_L
+     !> The penalty factor for the lift deviation.
+     real(kind=rp) :: beta
+
    contains
      !> The common constructor using a JSON object.
      procedure, pass(this) :: init => &
@@ -99,57 +97,36 @@ contains
     type(coef_t), intent(in), target :: coef
     character(len=*), intent(in) :: variable_name
 
-
   end subroutine adjoint_actuator_line_source_term_init_from_json
 
   !> The constructor from type components.
   !! @param this The source term.
-  !! @param f_s RHS of the adjoint scalar.
-  !! @param s the forward scalar field.
-  !! @param obj_scale a scaling factor.
-  !! @param phi_ref target concentration.
-  !! @param mask the mask for the source term.
-  !! @param if_mask whether to use the mask.
+  !! @param fields A list of fields for adding the source values.
   !! @param coef The SEM coeffs.
-  !! @param start_time start of the integration window.
-  !! @param end_time end of the integration window.
-  subroutine adjoint_actuator_line_source_term_init_from_components(this, &
-       f_s, s, obj_scale, phi_ref, mask, if_mask, coef, start_time, end_time)
+  !! @param beta The penalty factor for the lift deviation
+  !! @param delta_L The lift deviation
+  !! @param gamma_vec The design circulation vector
+  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, beta, delta_L, gamma_vec)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
-    type(field_t), pointer, intent(in) :: f_s
-    type(field_t), intent(in), target :: s
-    real(kind=rp), intent(in) :: obj_scale
-    real(kind=rp), intent(in) :: phi_ref
-    class(point_zone_t), intent(in), target :: mask
-    logical, intent(in) :: if_mask
+    type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
-    real(kind=rp), intent(in) :: start_time
-    real(kind=rp), intent(in) :: end_time
+    real(kind=rp), intent(in) :: beta
+    real(kind=rp), intent(in) :: delta_L
+    type(vector_t), pointer, intent(in) :: gamma_vec
 
-    type(field_list_t) :: fields
+    real(kind=rp) :: start_time, end_time
 
-    call this%free()
-
-    ! this is copying the fluid source term init
-    ! We package the fields for the source term to operate on in a field list.
-    call fields%init(1)
-    call fields%assign(1, f_s)
+    ! Mandatory parameters for the general source term
+    start_time = 0.0_rp
+    end_time = huge(0.0_rp)
 
     call this%init_base(fields, coef, start_time, end_time)
     call fields%free()
 
-    ! point everything in the correct places
-    this%s => s
-    this%obj_scale = obj_scale
-    this%phi_ref = phi_ref
-    this%if_mask = if_mask
-
-    if (this%if_mask) then
-       this%mask => mask
-       this%mask_volume = compute_masked_volume(this%mask, coef)
-    else
-       this%mask_volume = coef%volume
-    end if
+    ! Point everything in the correct places
+    this%gamma_vec => gamma_vec
+    this%delta_L = delta_L
+    this%beta = beta
 
   end subroutine adjoint_actuator_line_source_term_init_from_components
 
@@ -157,9 +134,8 @@ contains
   subroutine adjoint_actuator_line_source_term_free(this)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
 
+    nullify(this%gamma_vec)
     call this%free_base()
-    nullify(this%s)
-    nullify(this%mask)
 
   end subroutine adjoint_actuator_line_source_term_free
 
@@ -169,27 +145,43 @@ contains
   subroutine adjoint_actuator_line_source_term_compute(this, time)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(time_state_t), intent(in) :: time
-    type(field_t), pointer :: fs
-    type(field_t), pointer :: work
-    integer :: temp_indices(1)
+    
+    type(field_t), pointer :: fu, fv, fw
+    real(kind=rp), allocatable :: f_dagger(:, :)
+    real(kind=rp), allocatable :: gamma_ex_x(:), gamma_ex_y(:), gamma_ex_z(:)
+    real(kind=rp), allocatable :: gamma_ez_x(:), gamma_ez_y(:), gamma_ez_z(:)
+    real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
+    integer :: n, n_alm, j
 
+    n = this%fields%item_size(1)
+    n_alm = size(this%gamma_vec%x)
+    allocate(f_dagger(n_alm, 3))
 
-    fs => this%fields%get(1)
+    allocate(gamma_ex_x(n_alm), gamma_ex_y(n_alm), gamma_ex_z(n_alm))
+    allocate(gamma_ez_x(n_alm), gamma_ez_y(n_alm), gamma_ez_z(n_alm))
+    allocate(zero_vec(n_alm), one_vec(n_alm))
 
-    call neko_scratch_registry%request_field(work, temp_indices(1), .false.)
-    ! \phi
-    call field_copy(work, this%s)
-    ! \phi - \phi_ref
-    call field_cadd(work, -this%phi_ref)
-    ! mask
-    if (this%if_mask) then
-       call mask_exterior_const(work, this%mask, 0.0_rp)
-    end if
+    ! Get adjoint RHS fields
+    fu => this%fields%get_by_index(1)
+    fv => this%fields%get_by_index(2)
+    fw => this%fields%get_by_index(3)
 
-    ! append to RHS with scaling and mask volume
-    call field_add2s2(fs, work, this%obj_scale / this%mask_volume)
-    call neko_scratch_registry%relinquish_field(temp_indices)
+    ! Clear old source terms
+    call rzero(fu%x, n)
+    call rzero(fv%x, n)
+    call rzero(fw%x, n)
 
+    ! Update source terms
+    call vcross(gamma_ex_x, gamma_ex_y, gamma_ex_z, zero_vec, this%gamma_vec%x(j), zero_vec, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of gamma and x direction
+    call vcross(gamma_ez_x, gamma_ez_y, gamma_ez_z, zero_vec, this%gamma_vec%x(j), zero_vec, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of gamma and z direction
+    
+    ! Volumetric convolution of the adjoint veloctiy with the gaussian kernel
+    
+    ! Cross product of gamma and volumetric convolution
+    
+    f_dagger(:, 1) = -gamma_ex_x - this%beta * this%delta_L * gamma_ez_x
+    f_dagger(:, 2) = -gamma_ex_y - this%beta * this%delta_L * gamma_ez_y
+    f_dagger(:, 3) = -gamma_ex_z - this%beta * this%delta_L * gamma_ez_z
 
   end subroutine adjoint_actuator_line_source_term_compute
 
