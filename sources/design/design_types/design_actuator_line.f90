@@ -36,14 +36,18 @@
 module actuator_line_design
   use num_types, only: rp, sp, dp
   use field_list, only: field_list_t
+  use field, only: field_t
+  use global_interpolation, only: global_interpolation_t
   use json_module, only: json_file
   use adjoint_fluid_pnpn, only: adjoint_fluid_pnpn_t
   use neko_config, only: NEKO_BCKND_DEVICE
+  use registry, only : neko_registry
   use design, only: design_t
   use simulation_m, only: simulation_t
   use actuator_line_source_term, only: actuator_line_source_term_t
   use adjoint_actuator_line_source_term, only: adjoint_actuator_line_source_term_t
   use vector, only: vector_t
+  use matrix, only: matrix_t
   use math, only: copy
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use json_utils, only: json_get, json_get_or_default
@@ -59,8 +63,10 @@ module actuator_line_design
      real(kind=rp), allocatable :: gamm(:)
      !> Vector of sensitivities (dJ/dGamma)
      real(kind=rp), allocatable :: sensitivity(:)
-     !> Pointer to the actuator line forward source term object
-     type(actuator_line_source_term_t), pointer :: forward_source_ptr => null()
+     !> Global interpolation object
+     type(global_interpolation_t) :: interpolator
+     !> Actuator line instance id
+     integer :: alm_id
 
    contains
 
@@ -118,9 +124,10 @@ contains
     call json_get(parameters, 'xcenter', x_center)
     call json_get(parameters, 'ycenter', y_center)
     call json_get(parameters, 'zcenter', z_center)
+    call json_get(parameters, 'gamma', this%gamm)
     
-    allocate(this%gamm(N))
-    this%gamm = 1.0_rp
+    ! allocate(this%gamm(N))
+    ! this%gamm = 1.0_rp
 
     ! Initialize and inject into the simulation
     call this%init_from_components(name, simulation, N, b, AR, eps, &
@@ -144,7 +151,7 @@ contains
 
   subroutine actuator_line_design_init_from_components(this, name, simulation, N, b, AR, eps, &
         x_center, y_center, z_center)
-    class(actuator_line_design_t), intent(inout) :: this
+    class(actuator_line_design_t), target, intent(inout) :: this
     character(len=*), intent(in) :: name
     type(simulation_t), intent(inout) :: simulation
     integer, intent(in) :: N
@@ -167,13 +174,13 @@ contains
     call fields%assign(2, simulation%fluid%f_y)
     call fields%assign(3, simulation%fluid%f_z)
 
+    ! Init interpolator
+    call this%interpolator%init(simulation%fluid%u%dof)
+
     ! Init the actuator line term for the forward problem
     call forward_source%init_from_compenents(fields, simulation%fluid%c_Xh, &
-         N, 1.0_rp, b, AR, eps, x_center, y_center, z_center, this%gamm)
+         N, 1.0_rp, b, AR, eps, x_center, y_center, z_center, this%gamm, this%interpolator, this%alm_id)
     
-    ! Store a pointer to the forward object
-    this%forward_source_ptr => forward_source 
-
     ! Append source term to the forward problem
     call simulation%fluid%source_term%add(forward_source)
 
@@ -234,37 +241,50 @@ contains
     real(kind=rp), intent(out) :: CL
     real(kind=rp), intent(out) :: CD
 
-    call this%forward_source_ptr%compute_coefficients(CL, CD)
+    character(len=64) :: coefs_name
+    type(vector_t), pointer :: coefs
+
+    write(coefs_name, '("alm_", A, "_", I0)') "coefs", this%alm_id
+    coefs => neko_registry%get_vector(trim(coefs_name))
+
+    CL = coefs%x(1)
+    CD = coefs%x(2)
 
   end subroutine actuator_line_design_get_coefficients
   
   subroutine actuator_line_design_get_x(this, x)
     class(actuator_line_design_t), intent(in) :: this
     real(kind=rp), intent(out), allocatable :: x(:)
-    real(kind=rp), allocatable :: x_vec(:,:)
+    character(len=64) :: name
+    type(matrix_t), pointer :: x_vec
 
-    call this%forward_source_ptr%get_x_vec(x_vec)
-    x = x_vec(:, 1)
+    write(name, '("alm_", A, "_", I0)') "x_vec", this%alm_id
+    x_vec => neko_registry%get_matrix(trim(name))
+    x = x_vec%x(:, 1)
 
   end subroutine actuator_line_design_get_x
 
   subroutine actuator_line_design_get_y(this, y)
     class(actuator_line_design_t), intent(in) :: this
     real(kind=rp), intent(out), allocatable :: y(:)
-    real(kind=rp), allocatable :: x_vec(:,:)
+    character(len=64) :: name
+    type(matrix_t), pointer :: x_vec
 
-    call this%forward_source_ptr%get_x_vec(x_vec)
-    y = x_vec(:, 2)
+    write(name, '("alm_", A, "_", I0)') "x_vec", this%alm_id
+    x_vec => neko_registry%get_matrix(trim(name))
+    y = x_vec%x(:, 2)
 
   end subroutine actuator_line_design_get_y
 
   subroutine actuator_line_design_get_z(this, z)
     class(actuator_line_design_t), intent(in) :: this
     real(kind=rp), intent(out), allocatable :: z(:)
-    real(kind=rp), allocatable :: x_vec(:,:)
+    character(len=64) :: name
+    type(matrix_t), pointer :: x_vec
 
-    call this%forward_source_ptr%get_x_vec(x_vec)
-    z = x_vec(:, 3)
+    write(name, '("alm_", A, "_", I0)') "x_vec", this%alm_id
+    x_vec => neko_registry%get_matrix(trim(name))
+    z = x_vec%x(:, 3)
 
   end subroutine actuator_line_design_get_z
 
