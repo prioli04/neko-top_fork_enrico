@@ -34,14 +34,16 @@
 !
 !> Implements the `actuator_line_objective_t` type.
 !
-! J = CD + (\beta / 2) (CL - {CL_target})^2
+! J = D + (\beta / 2) (L - {L_target})^2
 !
 module actuator_line_objective
   use vector, only: vector_t
+  use matrix, only: matrix_t
   use objective, only: objective_t
   use design, only: design_t
   use actuator_line_design, only: actuator_line_design_t
   use simulation_m, only: simulation_t
+  use actuator_line_source_term, only: make_registry_name
   use adjoint_actuator_line_source_term, only: &
        adjoint_actuator_line_source_term_t
   use adjoint_fluid_pnpn, only: adjoint_fluid_pnpn_t
@@ -58,16 +60,15 @@ module actuator_line_objective
   use registry, only: neko_registry
   use space, only: space_t, GL
   use coefs, only: coef_t
-  use math, only: glsc2, copy, col2, invcol2
+  use math, only: vcross, glsc2, copy, col2, invcol2
   use device_math, only: device_copy, device_glsc2, device_col2, device_invcol2
-  use math_ext, only: glsc2_mask
-  use field_math, only: field_col3, field_addcol3, field_cmult, field_col2
+  use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use continuation_scheduler, only: nekotop_continuation
   implicit none
   private
 
   !> An objective function corresponding to drag plus a quadratic lift deviation penalty
-  !! \f$ J = CD + (\beta / 2) (CL - {CL_target})^2 \f$
+  !! \f$ J = D + (\beta / 2) (L - {L_target})^2 \f$
   type, public, extends(objective_t) :: actuator_line_objective_t
      private
 
@@ -76,7 +77,7 @@ module actuator_line_objective
      !> weight of the lift deviation penalty term
      real(kind=rp) :: lift_penalty_weight
      !> target lift coefficient
-     real(kind=rp) :: CL_target
+     real(kind=rp) :: L_target
 
    contains
 
@@ -136,6 +137,7 @@ contains
     type(adjoint_actuator_line_source_term_t) :: actuator_line_adjoint_source
 
     ! Call the base initializer
+    print *, design%size()
     call this%init_base(name, design%size(), weight)
 
     ! Get the circulation distribution
@@ -145,7 +147,7 @@ contains
     type is (actuator_line_design_t)
        call design%get_values(this%gamma_vec)
        this%lift_penalty_weight = design%lift_penalty_weight
-       this%CL_target = design%CL_target
+       this%L_target = design%L_target
 
     class default
        call neko_error('Actuator line objective only works with '// &
@@ -186,81 +188,108 @@ contains
     end select
 
     ! Objective: J = drag + (\beta / 2) (lift - lift_target)^2
-    write(force_nondim_factor_name, '("alm_", A, "_", I0)') "force_nondim_factor", alm_id
-    force_nondim_factor => neko_registry%get_real_scalar(force_nondim_factor_name)
-    lift_target = this%CL_target / force_nondim_factor
-    this%value = drag + 0.5_rp * this%lift_penalty_weight * (lift - lift_target)**2
+    this%value = drag + 0.5_rp * this%lift_penalty_weight * (lift - this%L_target)**2
 
     print *, "actuator_line_update_value"
     print *, this%value
 
   end subroutine actuator_line_update_value
 
-  !> update_value the sensitivity of the objective function with respect to
-  !! \f$chi\f$
+  !> update_value the sensitivity of the objective function with respect to Gamma
   !! @param this The objective.
   !! @param design the design.
   subroutine actuator_line_update_sensitivity(this, design)
     class(actuator_line_objective_t), intent(inout) :: this
     class(design_t), intent(in) :: design
-    type(field_t), pointer :: work
-    integer :: temp_indices(1)
-    integer :: n_GL, nel
-    type(field_t), pointer :: accumulate, fld_GL
-    integer :: temp_indices_GL(2)
 
-    ! The Brinkman dissipation adds an extra term in the sensitivity.
+    type(field_t), pointer :: u_adj, v_adj, w_adj, temp_kernel
+    type(matrix_t), pointer :: kernel
+    type(vector_t), pointer :: u_interp, v_interp, w_interp, resultant_force
+    real(kind=rp), allocatable :: velinterp_ex_x(:), velinterp_ex_y(:), velinterp_ex_z(:)
+    real(kind=rp), allocatable :: velinterp_ez_x(:), velinterp_ez_y(:), velinterp_ez_z(:)
+    real(kind=rp), allocatable :: conv_x(:), conv_y(:), conv_z(:)
+    real(kind=rp), allocatable :: velinterp_conv_x(:), velinterp_conv_y(:), velinterp_conv_z(:)
+    real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
+    real(kind=rp), allocatable :: grad(:, :)
+    real(kind=rp) :: delta_L
+    integer :: j, n_alm, n_dof, alm_id, temp_index
+    character(len=64) :: kernel_name, resultant_force_name
 
-   !  call neko_scratch_registry%request_field(work, temp_indices(1), .false.)
+    ! Get interpolated velocities
+    select type (design)
+    type is (actuator_line_design_t)
+       call design%get_adjoint_velocities(u_adj, v_adj, w_adj)
+       call design%get_interp_velocities(u_interp, v_interp, w_interp)
+       alm_id = design%alm_id
 
-   !  if(this%dealias_sensitivity) then
-   !     nel = this%c_Xh_GLL%msh%nelv
-   !     n_GL = nel * this%Xh_GL%lxyz
-   !     call this%scratch_GL%request_field(accumulate, temp_indices_GL(1), &
-   !          .false.)
-   !     call this%scratch_GL%request_field(fld_GL, temp_indices_GL(2), .false.)
+    class default
+       call neko_error('Actuator line objective only works with '// &
+            'actuator_line_design')
+    end select
 
-   !     call this%GLL_to_GL%map(fld_GL%x, this%u%x, nel, this%Xh_GL)
-   !     call field_col3(accumulate, fld_GL, fld_GL)
-   !     call this%GLL_to_GL%map(fld_GL%x, this%v%x, nel, this%Xh_GL)
-   !     call field_addcol3(accumulate, fld_GL, fld_GL)
-   !     if (this%gdim .eq. 3) then
-   !        call this%GLL_to_GL%map(fld_GL%x, this%w%x, nel, this%Xh_GL)
-   !        call field_addcol3(accumulate, fld_GL, fld_GL)
-   !     end if
-   !     ! scale
-   !     call field_cmult(accumulate, this%weight * 0.5_rp / this%volume)
+    n_alm = this%gamma_vec%size()
 
-   !     ! Evaluate term on GL and preempt the GLL premultiplication
-   !     if (NEKO_BCKND_DEVICE .eq. 1) then
-   !        call device_col2(accumulate%x_d, this%c_Xh_GL%B_d, n_GL)
-   !        call this%GLL_to_GL%map(work%x, accumulate%x, nel, this%Xh_GLL)
-   !        call device_invcol2(work%x_d, this%c_Xh_GLL%B_d, work%size())
-   !     else
-   !        call col2(accumulate%x, this%c_Xh_GL%B, n_GL)
-   !        call this%GLL_to_GL%map(work%x, accumulate%x, nel, this%Xh_GLL)
-   !        call invcol2(work%x, this%c_Xh_GLL%B, work%size())
-   !     end if
+    ! Allocate arrays
+    allocate(velinterp_ex_x(n_alm), velinterp_ex_y(n_alm), velinterp_ex_z(n_alm))
+    allocate(velinterp_ez_x(n_alm), velinterp_ez_y(n_alm), velinterp_ez_z(n_alm))
+    allocate(conv_x(n_alm), conv_y(n_alm), conv_z(n_alm))
+    allocate(velinterp_conv_x(n_alm), velinterp_conv_y(n_alm), velinterp_conv_z(n_alm))
+    allocate(zero_vec(n_alm), one_vec(n_alm))
+    allocate(grad(n_alm, 3))
 
-   !     call this%scratch_GL%relinquish_field(temp_indices_GL)
+    zero_vec = 0.0_rp
+    one_vec = 1.0_rp
 
-   !  else
-   !     call field_col3(work, this%u, this%u)
-   !     call field_addcol3(work, this%v, this%v)
-   !     if (this%gdim .eq. 3) then
-   !        call field_addcol3(work, this%w, this%w)
-   !     end if
-   !     ! scale
-   !     call field_cmult(work, this%weight * 0.5_rp / this%volume)
-   !  end if
+    ! Get kernel values
+    kernel_name = make_registry_name("kernel", alm_id)
+    kernel => neko_registry%get_matrix(kernel_name)
+    n_dof = size(kernel%x, 1)
 
-   !  if (NEKO_BCKND_DEVICE .eq. 1) then
-   !     call device_copy(this%sensitivity%x_d, work%x_d, this%sensitivity%size())
-   !  else
-   !     call copy(this%sensitivity%x, work%x, this%sensitivity%size())
-   !  end if
+    ! Compute lift deviation
+    resultant_force_name = make_registry_name("resultant_force", alm_id)
+    resultant_force => neko_registry%get_vector(resultant_force_name)
+    delta_L = resultant_force%x(1) - this%L_target
 
-   !  call neko_scratch_registry%relinquish_field(temp_indices)
+    call vcross(velinterp_ex_x, velinterp_ex_y, velinterp_ex_z, &
+      u_interp%x, v_interp%x, w_interp%x, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of interpolated velocities and x direction
+    call vcross(velinterp_ez_x, velinterp_ez_y, velinterp_ez_z, &
+      u_interp%x, v_interp%x, w_interp%x, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of interpolated velocities and z direction
+
+    ! Volumetric convolution of the adjoint velocity with the gaussian kernel
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call neko_scratch_registry%request_field(temp_kernel, temp_index, .false.)
+
+      do j = 1, n_alm
+        call device_memcpy(kernel%x(:,j), temp_kernel%x_d, n_dof, HOST_TO_DEVICE, sync=.true.)
+        conv_x(j) = device_glsc2(u_adj%x_d, temp_kernel%x_d, n_dof)
+        conv_y(j) = device_glsc2(v_adj%x_d, temp_kernel%x_d, n_dof)
+        conv_z(j) = device_glsc2(w_adj%x_d, temp_kernel%x_d, n_dof)
+      end do
+
+      call neko_scratch_registry%relinquish_field(temp_index)
+    else
+      do j = 1, n_alm
+        conv_x(j) = glsc2(u_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+        conv_y(j) = glsc2(v_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+        conv_z(j) = glsc2(w_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+      end do
+    end if
+
+    ! Cross product of interpolated velocities and volumetric convolution
+    call vcross(velinterp_conv_x, velinterp_conv_y, velinterp_conv_z, &
+      u_interp%x, v_interp%x, w_interp%x, conv_x, conv_y, conv_z, n_alm) 
+
+    ! Compute gradient with respect to gamma_vec
+    grad(:, 1) = velinterp_conv_x - velinterp_ex_x - this%lift_penalty_weight * delta_L * velinterp_ez_x
+    grad(:, 2) = velinterp_conv_y - velinterp_ex_y - this%lift_penalty_weight * delta_L * velinterp_ez_y
+    grad(:, 3) = velinterp_conv_z - velinterp_ex_z - this%lift_penalty_weight * delta_L * velinterp_ez_z
+
+    ! Take only y-component perturbations for now
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_memcpy(grad(:, 2), this%sensitivity%x_d, n_alm, HOST_TO_DEVICE, sync=.true.)
+    else
+       call copy(this%sensitivity%x, grad(:, 2), this%sensitivity%size())
+    end if
 
   end subroutine actuator_line_update_sensitivity
 

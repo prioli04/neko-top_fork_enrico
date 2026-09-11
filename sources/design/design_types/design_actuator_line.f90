@@ -44,7 +44,7 @@ module actuator_line_design
   use registry, only : neko_registry
   use design, only: design_t
   use simulation_m, only: simulation_t
-  use actuator_line_source_term, only: actuator_line_source_term_t
+  use actuator_line_source_term, only: actuator_line_source_term_t, make_registry_name
   use adjoint_actuator_line_source_term, only: adjoint_actuator_line_source_term_t
   use vector, only: vector_t
   use matrix, only: matrix_t
@@ -65,10 +65,16 @@ module actuator_line_design
      real(kind=rp), allocatable :: sensitivity(:)
      !> Global interpolation object
      type(global_interpolation_t) :: interpolator
+     !> u of the adjoint
+     type(field_t), pointer :: u_adj => null()
+     !> v of the adjoint
+     type(field_t), pointer :: v_adj => null()
+     !> w of the adjoint
+     type(field_t), pointer :: w_adj => null()
      !> Weight of the lift deviation penalty term
      real(kind=rp), public :: lift_penalty_weight
-     !> Target lift coefficient
-     real(kind=rp), public :: CL_target
+     !> Target lift
+     real(kind=rp), public :: L_target
      !> Actuator line instance id
      integer, public :: alm_id
 
@@ -89,6 +95,10 @@ module actuator_line_design
      procedure, pass(this) :: get_resultant_force => actuator_line_design_get_resultant_force
      !> Retrieve the design variables
      procedure, pass(this) :: get_values => actuator_line_design_get_design
+     !> Retrieve adjoint velocity field
+     procedure, pass(this) :: get_adjoint_velocities => actuator_line_design_get_adjoint_velocities
+     !> Retrieve interpolated velocities
+     procedure, pass(this) :: get_interp_velocities => actuator_line_design_get_interp_velocities
      !> Retrieve the sensitivity
      procedure, pass(this) :: get_sensitivity => actuator_line_design_get_sensitivity
      !> Retrieve the x location of the design variables
@@ -150,6 +160,9 @@ contains
     if (allocated(this%sensitivity)) then
       deallocate(this%sensitivity)
     end if
+    nullify(this%u_adj)
+    nullify(this%v_adj)
+    nullify(this%w_adj)
     call this%free_base()
 
   end subroutine actuator_line_design_free
@@ -174,11 +187,14 @@ contains
     type(actuator_line_source_term_t) :: forward_source
     type(adjoint_actuator_line_source_term_t) :: adjoint_source
     type(field_list_t) :: fields_forward, fields_adjoint
+    real(kind=rp) :: force_nondim_factor
 
     call this%init_base(name, N)
     this%gamma_vec = gamma_vec
     this%lift_penalty_weight = lift_penalty_weight
-    this%CL_target = CL_target
+    this%u_adj => simulation%adjoint_fluid%u_adj
+    this%v_adj => simulation%adjoint_fluid%v_adj
+    this%w_adj => simulation%adjoint_fluid%w_adj
 
     ! Init list of source fields used for initializing Neko's sources
     call fields_forward%init(3)
@@ -190,9 +206,11 @@ contains
     call this%interpolator%init(simulation%fluid%u%dof)
 
     ! Init the actuator line term for the forward problem
-    call forward_source%init_from_components(fields_forward, simulation%fluid%c_Xh, &
-         N, CL_target, V_inf, b, AR, eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id)
+    call forward_source%init_from_components(fields_forward, simulation%fluid%c_Xh, N, CL_target, &
+      V_inf, b, AR, eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id, force_nondim_factor)
     
+    this%L_target = CL_target / force_nondim_factor
+
     ! Append source term to the forward problem
     call simulation%fluid%source_term%add(forward_source)
 
@@ -205,7 +223,7 @@ contains
     ! Init the actuator line term for the adjoint
     call adjoint_source%init_from_components(fields_adjoint, simulation%adjoint_fluid%c_Xh, this%interpolator, &
          simulation%adjoint_fluid%u_adj, simulation%adjoint_fluid%v_adj, simulation%adjoint_fluid%w_adj, &
-         this%gamma_vec, lift_penalty_weight, CL_target, this%alm_id)
+         this%gamma_vec, lift_penalty_weight, this%L_target, this%alm_id)
          
     ! Append source term to the adjoint problem
     select type (f => simulation%adjoint_fluid)
@@ -233,6 +251,32 @@ contains
 
   end subroutine actuator_line_design_get_design
 
+  subroutine actuator_line_design_get_adjoint_velocities(this, u_adj, v_adj, w_adj)
+    class(actuator_line_design_t), intent(in) :: this
+    type(field_t), pointer, intent(out) :: u_adj, v_adj, w_adj
+
+    u_adj => this%u_adj
+    v_adj => this%v_adj
+    w_adj => this%w_adj
+
+  end subroutine actuator_line_design_get_adjoint_velocities
+
+  subroutine actuator_line_design_get_interp_velocities(this, u_interp, v_interp, w_interp)
+    class(actuator_line_design_t), intent(in) :: this
+    type(vector_t), pointer, intent(out) :: u_interp, v_interp, w_interp
+
+    character(len=64) :: u_name, v_name, w_name
+
+    u_name = make_registry_name("u_interp", this%alm_id)
+    v_name = make_registry_name("v_interp", this%alm_id)
+    w_name = make_registry_name("w_interp", this%alm_id)
+
+    u_interp => neko_registry%get_vector(trim(u_name))
+    v_interp => neko_registry%get_vector(trim(v_name))
+    w_interp => neko_registry%get_vector(trim(w_name))
+
+  end subroutine actuator_line_design_get_interp_velocities
+
   subroutine actuator_line_design_get_sensitivity(this, values)
     class(actuator_line_design_t), intent(in) :: this
     type(vector_t), intent(inout) :: values
@@ -253,7 +297,7 @@ contains
     character(len=64) :: resultant_force_name
     type(vector_t), pointer :: resultant_force
 
-    write(resultant_force_name, '("alm_", A, "_", I0)') "resultant_force", this%alm_id
+    resultant_force_name = make_registry_name("resultant_force", this%alm_id)
     resultant_force => neko_registry%get_vector(trim(resultant_force_name))
 
     lift = resultant_force%x(1)
@@ -267,7 +311,7 @@ contains
     character(len=64) :: name
     type(matrix_t), pointer :: x_vec
 
-    write(name, '("alm_", A, "_", I0)') "x_vec", this%alm_id
+    name = make_registry_name("x_vec", this%alm_id)
     x_vec => neko_registry%get_matrix(trim(name))
     x = x_vec%x(:, 1)
 
@@ -279,7 +323,7 @@ contains
     character(len=64) :: name
     type(matrix_t), pointer :: x_vec
 
-    write(name, '("alm_", A, "_", I0)') "x_vec", this%alm_id
+    name = make_registry_name("x_vec", this%alm_id)
     x_vec => neko_registry%get_matrix(trim(name))
     y = x_vec%x(:, 2)
 
@@ -291,7 +335,7 @@ contains
     character(len=64) :: name
     type(matrix_t), pointer :: x_vec
 
-    write(name, '("alm_", A, "_", I0)') "x_vec", this%alm_id
+    name = make_registry_name("x_vec", this%alm_id)
     x_vec => neko_registry%get_matrix(trim(name))
     z = x_vec%x(:, 3)
 
