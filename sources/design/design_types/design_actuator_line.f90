@@ -60,13 +60,17 @@ module actuator_line_design
      private
 
      !> Vector of circulations (the design variables)
-     type(vector_t), pointer :: gamma_vec => null()
+     real(kind=rp), allocatable :: gamma_vec(:)
      !> Vector of sensitivities (dJ/dGamma)
      real(kind=rp), allocatable :: sensitivity(:)
      !> Global interpolation object
      type(global_interpolation_t) :: interpolator
+     !> Weight of the lift deviation penalty term
+     real(kind=rp), public :: lift_penalty_weight
+     !> Target lift coefficient
+     real(kind=rp), public :: CL_target
      !> Actuator line instance id
-     integer :: alm_id
+     integer, public :: alm_id
 
    contains
 
@@ -76,13 +80,13 @@ module actuator_line_design
      !> Initialize the design
      generic, public :: init => init_from_json_sim, init_from_components
      !> Initialize the design from a JSON file
-     procedure, pass(this), public :: init_from_json_sim => &
+     procedure, pass(this) :: init_from_json_sim => &
           actuator_line_design_init_from_json_sim
      !> Initialize the design from components
-     procedure, pass(this), public :: init_from_components => &
+     procedure, pass(this) :: init_from_components => &
           actuator_line_design_init_from_components
      !> Retrieve lift and drag
-     procedure, pass(this), public :: get_resultant_force => actuator_line_design_get_resultant_force
+     procedure, pass(this) :: get_resultant_force => actuator_line_design_get_resultant_force
      !> Retrieve the design variables
      procedure, pass(this) :: get_values => actuator_line_design_get_design
      !> Retrieve the sensitivity
@@ -114,11 +118,13 @@ contains
     character(len=:), allocatable :: name
 
     integer :: N
-    real(kind=rp) :: CL, V_inf, b, AR, eps, x_center, y_center, z_center
-    real(kind=rp), allocatable :: gamm(:)
+    real(kind=rp) :: lift_penalty_weight, CL_target, V_inf, b, AR, eps, x_center, y_center, z_center
+    real(kind=rp), allocatable :: gamma_vec(:)
 
     call json_get_or_default(parameters, 'name', name, 'Actuator Line Design')
     call json_get(parameters, "N", N)
+    call json_get(parameters, "lift_penalty_weight", lift_penalty_weight)
+    call json_get(parameters, "CL_target", CL_target)
     call json_get(parameters, "V_inf", V_inf)
     call json_get(parameters, 'b', b)
     call json_get(parameters, 'AR', AR)
@@ -126,11 +132,11 @@ contains
     call json_get(parameters, 'xcenter', x_center)
     call json_get(parameters, 'ycenter', y_center)
     call json_get(parameters, 'zcenter', z_center)
-    call json_get(parameters, 'gamma', gamm)
+    call json_get(parameters, 'gamma', gamma_vec)
     
     ! Initialize and inject into the simulation
-    call this%init_from_components(name, simulation, N, V_inf, b, AR, eps, &
-        x_center, y_center, z_center, gamm)
+    call this%init_from_components(name, simulation, N, lift_penalty_weight, CL_target, V_inf, b, AR, eps, &
+    x_center, y_center, z_center, gamma_vec)
 
   end subroutine actuator_line_design_init_from_json_sim
 
@@ -138,20 +144,24 @@ contains
   subroutine actuator_line_design_free(this)
     class(actuator_line_design_t), intent(inout) :: this
 
+    if (allocated(this%gamma_vec)) then
+      deallocate(this%gamma_vec)
+    end if
     if (allocated(this%sensitivity)) then
       deallocate(this%sensitivity)
     end if
-    nullify(this%gamma_vec)
     call this%free_base()
 
   end subroutine actuator_line_design_free
 
-  subroutine actuator_line_design_init_from_components(this, name, simulation, N, V_inf, b, AR, eps, &
-        x_center, y_center, z_center, gamm)
+    subroutine actuator_line_design_init_from_components(this, name, simulation, N, lift_penalty_weight, CL_target, V_inf, b, AR, &
+      eps, x_center, y_center, z_center, gamma_vec)
     class(actuator_line_design_t), target, intent(inout) :: this
     character(len=*), intent(in) :: name
     type(simulation_t), intent(inout) :: simulation
     integer, intent(in) :: N
+    real(kind=rp), intent(in) :: lift_penalty_weight
+    real(kind=rp), intent(in) :: CL_target
     real(kind=rp), intent(in) :: V_inf
     real(kind=rp), intent(in) :: b
     real(kind=rp), intent(in) :: AR
@@ -159,14 +169,16 @@ contains
     real(kind=rp), intent(in) :: x_center
     real(kind=rp), intent(in) :: y_center
     real(kind=rp), intent(in) :: z_center
-    real(kind=rp), intent(in) :: gamm(:)
+    real(kind=rp), intent(in) :: gamma_vec(:)
 
     type(actuator_line_source_term_t) :: forward_source
     type(adjoint_actuator_line_source_term_t) :: adjoint_source
     type(field_list_t) :: fields_forward, fields_adjoint
-    character(len=64) :: gamma_name
 
     call this%init_base(name, N)
+    this%gamma_vec = gamma_vec
+    this%lift_penalty_weight = lift_penalty_weight
+    this%CL_target = CL_target
 
     ! Init list of source fields used for initializing Neko's sources
     call fields_forward%init(3)
@@ -178,12 +190,9 @@ contains
     call this%interpolator%init(simulation%fluid%u%dof)
 
     ! Init the actuator line term for the forward problem
-    call forward_source%init_from_compenents(fields_forward, simulation%fluid%c_Xh, &
-         N, 1.0_rp, V_inf, b, AR, eps, x_center, y_center, z_center, gamm, this%interpolator, this%alm_id)
+    call forward_source%init_from_components(fields_forward, simulation%fluid%c_Xh, &
+         N, CL_target, V_inf, b, AR, eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id)
     
-    write(gamma_name, '("alm_", A, "_", I0)') "gamma", this%alm_id
-    this%gamma_vec => neko_registry%get_vector(trim(gamma_name))
-
     ! Append source term to the forward problem
     call simulation%fluid%source_term%add(forward_source)
 
@@ -194,14 +203,16 @@ contains
     call fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
 
     ! Init the actuator line term for the adjoint
-    call adjoint_source%init_from_components(fields_adjoint, simulation%adjoint_fluid%c_Xh, this%gamma_vec)
+    call adjoint_source%init_from_components(fields_adjoint, simulation%adjoint_fluid%c_Xh, &
+         simulation%adjoint_fluid%u_adj, simulation%adjoint_fluid%v_adj, simulation%adjoint_fluid%w_adj, &
+         this%gamma_vec, lift_penalty_weight, CL_target, this%alm_id)
          
-    ! ! Append source term to the adjoint problem
-    ! select type (f => simulation%adjoint_fluid)
-    ! type is (adjoint_fluid_pnpn_t)
-    !    call f%source_term%add(adjoint_source)
-    ! class default
-    ! end select
+    ! Append source term to the adjoint problem
+    select type (f => simulation%adjoint_fluid)
+    type is (adjoint_fluid_pnpn_t)
+       call f%source_term%add(adjoint_source)
+    class default
+    end select
 
   end subroutine actuator_line_design_init_from_components
 
@@ -214,11 +225,11 @@ contains
     class(actuator_line_design_t), intent(in) :: this
     type(vector_t), intent(inout) :: values
 
-    if (size(this%gamma_vec%x) .ne. values%size()) then
+    if (size(this%gamma_vec) .ne. values%size()) then
        call neko_error('Get design: size mismatch')
     end if
 
-    call copy(values%x, this%gamma_vec%x, size(this%gamma_vec%x))
+    call copy(values%x, this%gamma_vec, size(this%gamma_vec))
 
   end subroutine actuator_line_design_get_design
 
@@ -226,11 +237,11 @@ contains
     class(actuator_line_design_t), intent(in) :: this
     type(vector_t), intent(inout) :: values
 
-    if (size(this%gamma_vec%x) .ne. values%size()) then
+    if (size(this%gamma_vec) .ne. values%size()) then
        call neko_error('Get sensitivity: size mismatch')
     end if
 
-    call copy(values%x, this%sensitivity, size(this%gamma_vec%x))
+    call copy(values%x, this%sensitivity, size(this%gamma_vec))
 
   end subroutine actuator_line_design_get_sensitivity
 
@@ -249,7 +260,7 @@ contains
     drag = resultant_force%x(2)
 
   end subroutine actuator_line_design_get_resultant_force
-  
+
   subroutine actuator_line_design_get_x(this, x)
     class(actuator_line_design_t), intent(in) :: this
     real(kind=rp), intent(out), allocatable :: x(:)
@@ -291,10 +302,10 @@ contains
     type(vector_t), intent(inout) :: values
     
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_memcpy(values%x, values%x_d, size(this%gamma_vec%x), DEVICE_TO_HOST, .true.)
+       call device_memcpy(values%x, values%x_d, size(this%gamma_vec), DEVICE_TO_HOST, .true.)
     end if
 
-    call copy(this%gamma_vec%x, values%x, size(this%gamma_vec%x))
+    call copy(this%gamma_vec, values%x, size(this%gamma_vec))
 
   end subroutine actuator_line_design_update_design
 
@@ -311,7 +322,7 @@ contains
     integer, intent(in) :: idx
 
     print *, "actuator_line_design_write"
-    print *, this%gamma_vec%x
+    print *, this%gamma_vec
 
   end subroutine actuator_line_design_write
 

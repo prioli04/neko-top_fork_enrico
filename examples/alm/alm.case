@@ -79,6 +79,8 @@
         "design": {
             "type": "actuator_line",
             "N": 10,
+            "lift_penalty_weight": 100.0,
+            "CL_target": 0.5,
             "V_inf": 1.0,
             "b": 2.0,
             "AR": 10.0,
@@ -110,9 +112,7 @@
         "objectives": [
             {
                 "type": "actuator_line",
-                "weight": 1.0,
-                "lift_penalty_weight": 100.0,
-                "CL_target": 0.5
+                "weight": 1.0
             }
         ]
     }

@@ -37,18 +37,18 @@ module adjoint_actuator_line_source_term
   use num_types, only : rp
   use field_list, only : field_list_t
   use field, only: field_t
+  use neko_config, only: NEKO_BCKND_DEVICE
   use registry, only: neko_registry
   use scratch_registry, only: neko_scratch_registry
   use json_module, only : json_file
   use time_state, only: time_state_t
-  use json_utils, only: json_get, json_get_or_default
   use source_term, only : source_term_t
   use coefs, only : coef_t
-  use vector, only: vector_t
-  use math, only : rzero, add2s2, vcross
-  use field_math, only: field_add2s2, field_copy, field_cadd
-  use mask_ops, only: mask_exterior_const, compute_masked_volume
-  use point_zone, only: point_zone_t
+  use matrix, only : matrix_t
+  use vector, only : vector_t
+  use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
+  use device_math, only : device_rzero, device_glsc2
+  use math, only : rzero, vcross, glsc2
   implicit none
   private
   public :: adjoint_actuator_line_source_term_allocate
@@ -56,11 +56,19 @@ module adjoint_actuator_line_source_term
   type, public, extends(source_term_t) :: adjoint_actuator_line_source_term_t
 
      !> The circulation distribution.
-     type(vector_t), pointer :: gamma_vec => null()
+     real(kind=rp), allocatable :: gamma_vec(:)
+     !> u of the adjoint
+     type(field_t), pointer :: u_adj => null()
+     !> v of the adjoint
+     type(field_t), pointer :: v_adj => null()
+     !> w of the adjoint
+     type(field_t), pointer :: w_adj => null()
+     !> The penalty factor for the lift deviation.
+     real(kind=rp) :: beta
      !> The lift deviation.
      real(kind=rp) :: delta_L
-     !> The penalty factor for the lift deviation.
-     real(kind=rp), pointer :: beta
+     !> Actuator line instance id
+     integer :: alm_id
 
    contains
      !> The common constructor using a JSON object.
@@ -103,17 +111,26 @@ contains
   !! @param this The source term.
   !! @param fields A list of fields for adding the source values.
   !! @param coef The SEM coeffs.
-  !! @param beta The penalty factor for the lift deviation
-  !! @param delta_L The lift deviation
-  !! @param gamma_vec The design circulation vector
-  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, gamma_vec)
+  !! @param u_adj X component of the adjoint velocity field.
+  !! @param v_adj Y component of the adjoint velocity field.
+  !! @param w_adj Z component of the adjoint velocity field.
+  !! @param gamma_vec The design circulation vector.
+  !! @param alm_id Actuator line id.
+  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, u_adj, v_adj, w_adj, gamma_vec,&
+    beta, CL_target, alm_id)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
-    type(vector_t), pointer, intent(in) :: gamma_vec
+    type(field_t), intent(in), target :: u_adj, v_adj, w_adj
+    real(kind=rp), allocatable, intent(in) :: gamma_vec(:)
+    real(kind=rp), intent(in) :: beta
+    real(kind=rp), intent(in) :: CL_target
+    integer, intent(in) :: alm_id
 
-    real(kind=rp), pointer :: CL_target
-    real(kind=rp) :: start_time, end_time, delta_CL
+    type(vector_t), pointer :: resultant_force
+    real(kind=rp), pointer :: force_nondim_factor
+    real(kind=rp) :: start_time, end_time
+    character(len=64) :: resultant_force_name, force_nondim_factor_name
 
     ! Mandatory parameters for the general source term
     start_time = 0.0_rp
@@ -122,22 +139,32 @@ contains
     call this%init_base(fields, coef, start_time, end_time)
 
     ! Point everything in the correct places
-    this%gamma_vec => gamma_vec
-    this%beta => neko_registry%get_real_scalar("alm_lift_penalty_weight")
+    this%u_adj => u_adj
+    this%v_adj => v_adj
+    this%w_adj => w_adj
+    this%gamma_vec = gamma_vec
+    this%beta = beta
+    this%alm_id = alm_id
 
     ! Compute lift deviation
-    CL_target => neko_registry%get_real_scalar("alm_CL_target")
+    write(resultant_force_name, '("alm_", A, "_", I0)') "resultant_force", this%alm_id
+    write(force_nondim_factor_name, '("alm_", A, "_", I0)') "force_nondim_factor", this%alm_id
 
-
-    delta_CL =  - CL_target
+    force_nondim_factor => neko_registry%get_real_scalar(force_nondim_factor_name)
+    resultant_force => neko_registry%get_vector(resultant_force_name)
+    this%delta_L = resultant_force%x(1) - CL_target / force_nondim_factor
 
   end subroutine adjoint_actuator_line_source_term_init_from_components
 
   !> Destructor.
   subroutine adjoint_actuator_line_source_term_free(this)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
-
-    nullify(this%gamma_vec)
+    if (allocated(this%gamma_vec)) then
+      deallocate(this%gamma_vec)
+    end if
+    nullify(this%u_adj)
+    nullify(this%v_adj)
+    nullify(this%w_adj)
     call this%free_base()
 
   end subroutine adjoint_actuator_line_source_term_free
@@ -149,42 +176,87 @@ contains
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(time_state_t), intent(in) :: time
     
-    type(field_t), pointer :: fu, fv, fw
-    real(kind=rp), allocatable :: f_dagger(:, :)
+    integer :: n_alm, n_dof, j, temp_index
+    type(field_t), pointer :: fu, fv, fw, temp_kernel
+    type(matrix_t), pointer :: kernel
+    character(len=64) :: kernel_name
+
     real(kind=rp), allocatable :: gamma_ex_x(:), gamma_ex_y(:), gamma_ex_z(:)
     real(kind=rp), allocatable :: gamma_ez_x(:), gamma_ez_y(:), gamma_ez_z(:)
+    real(kind=rp), allocatable :: conv_x(:), conv_y(:), conv_z(:)
+    real(kind=rp), allocatable :: gamma_conv_x(:), gamma_conv_y(:), gamma_conv_z(:)
     real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
-    integer :: n, n_alm, j
+    real(kind=rp), allocatable :: f_dagger(:, :)
 
-    n = this%fields%item_size(1)
-    n_alm = size(this%gamma_vec%x)
-    allocate(f_dagger(n_alm, 3))
+    n_alm = size(this%gamma_vec)
+    n_dof = this%fields%item_size(1)
 
+    ! Allocate arrays
     allocate(gamma_ex_x(n_alm), gamma_ex_y(n_alm), gamma_ex_z(n_alm))
     allocate(gamma_ez_x(n_alm), gamma_ez_y(n_alm), gamma_ez_z(n_alm))
+    allocate(conv_x(n_alm), conv_y(n_alm), conv_z(n_alm))
+    allocate(gamma_conv_x(n_alm), gamma_conv_y(n_alm), gamma_conv_z(n_alm))
     allocate(zero_vec(n_alm), one_vec(n_alm))
+    allocate(f_dagger(n_alm, 3))
 
+    zero_vec = 0.0_rp
+    one_vec = 1.0_rp
+
+    ! Get kernel values
+    write(kernel_name, '("alm_", A, "_", I0)') "kernel", this%alm_id
+    kernel => neko_registry%get_matrix(kernel_name)
+    
     ! Get adjoint RHS fields
     fu => this%fields%get_by_index(1)
     fv => this%fields%get_by_index(2)
     fw => this%fields%get_by_index(3)
 
     ! Clear old source terms
-    call rzero(fu%x, n)
-    call rzero(fv%x, n)
-    call rzero(fw%x, n)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call device_rzero(fu%x_d, n_dof)
+      call device_rzero(fv%x_d, n_dof)
+      call device_rzero(fw%x_d, n_dof)
+    else
+      call rzero(fu%x, n_dof)
+      call rzero(fv%x, n_dof)
+      call rzero(fw%x, n_dof)
+    end if
 
     ! Update source terms
-    call vcross(gamma_ex_x, gamma_ex_y, gamma_ex_z, zero_vec, this%gamma_vec%x(j), zero_vec, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of gamma and x direction
-    call vcross(gamma_ez_x, gamma_ez_y, gamma_ez_z, zero_vec, this%gamma_vec%x(j), zero_vec, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of gamma and z direction
-    
-    ! Volumetric convolution of the adjoint veloctiy with the gaussian kernel
-    
+    call vcross(gamma_ex_x, gamma_ex_y, gamma_ex_z, zero_vec, this%gamma_vec, zero_vec, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of gamma and x direction
+    call vcross(gamma_ez_x, gamma_ez_y, gamma_ez_z, zero_vec, this%gamma_vec, zero_vec, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of gamma and z direction
+
+    ! Volumetric convolution of the adjoint velocity with the gaussian kernel
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call neko_scratch_registry%request_field(temp_kernel, temp_index, .false.)
+
+      do j = 1, n_alm
+        call device_memcpy(kernel%x(:,j), temp_kernel%x_d, n_dof, HOST_TO_DEVICE, sync=.true.)
+        conv_x(j) = device_glsc2(this%u_adj%x_d, temp_kernel%x_d, n_dof)
+        conv_y(j) = device_glsc2(this%v_adj%x_d, temp_kernel%x_d, n_dof)
+        conv_z(j) = device_glsc2(this%w_adj%x_d, temp_kernel%x_d, n_dof)
+      end do
+
+      call neko_scratch_registry%relinquish_field(temp_index)
+    else
+      do j = 1, n_alm
+        conv_x(j) = glsc2(this%u_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+        conv_y(j) = glsc2(this%v_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+        conv_z(j) = glsc2(this%w_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+      end do
+    end if
+
     ! Cross product of gamma and volumetric convolution
+    call vcross(gamma_conv_x, gamma_conv_y, gamma_conv_z, zero_vec, this%gamma_vec, zero_vec, conv_x, conv_y, conv_z, n_alm) 
     
-    f_dagger(:, 1) = -gamma_ex_x - this%beta * this%delta_L * gamma_ez_x
-    f_dagger(:, 2) = -gamma_ex_y - this%beta * this%delta_L * gamma_ez_y
-    f_dagger(:, 3) = -gamma_ex_z - this%beta * this%delta_L * gamma_ez_z
+    ! Compute adjoint point forcing
+    f_dagger(:, 1) = gamma_conv_x - gamma_ex_x - this%beta * this%delta_L * gamma_ez_x
+    f_dagger(:, 2) = gamma_conv_y - gamma_ex_y - this%beta * this%delta_L * gamma_ez_y
+    f_dagger(:, 3) = gamma_conv_z - gamma_ex_z - this%beta * this%delta_L * gamma_ez_z
+
+    print *, f_dagger(:, 1)
+    print *, f_dagger(:, 2)
+    print *, f_dagger(:, 3)
 
   end subroutine adjoint_actuator_line_source_term_compute
 

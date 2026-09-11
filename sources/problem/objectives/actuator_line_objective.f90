@@ -71,18 +71,12 @@ module actuator_line_objective
   type, public, extends(objective_t) :: actuator_line_objective_t
      private
 
-     !> Pointer to the u field.
-     type(field_t), pointer :: u => null()
-     !> Pointer to the v field.
-     type(field_t), pointer :: v => null()
-     !> Pointer to the w field.
-     type(field_t), pointer :: w => null()
      !> Circulation distribution.
-     type(vector_t) :: gamm
+     type(vector_t) :: gamma_vec
      !> weight of the lift deviation penalty term
-     real(kind=rp), pointer :: lift_penalty_weight
+     real(kind=rp) :: lift_penalty_weight
      !> target lift coefficient
-     real(kind=rp), pointer :: CL_target
+     real(kind=rp) :: CL_target
 
    contains
 
@@ -117,20 +111,12 @@ contains
     type(simulation_t), target, intent(inout) :: simulation
 
     character(len=:), allocatable :: name
-    real(kind=rp) :: weight, CL_target, lift_penalty_weight
+    real(kind=rp) :: weight
 
     call nekotop_continuation%json_get_or_register(json, 'weight', this%weight, weight, 1.0_rp)
-    call json_get_or_default(json, "lift_penalty_weight", lift_penalty_weight, 1.0_rp)
-    call json_get_or_default(json, "CL_target", CL_target, 1.0_rp)
     call json_get_or_default(json, "name", name, "Actuator Line")
-
-    call neko_registry%add_real_scalar(lift_penalty_weight, "alm_lift_penalty_weight")
-    this%lift_penalty_weight => neko_registry%get_real_scalar("alm_lift_penalty_weight")
-
-    call neko_registry%add_real_scalar(CL_target, "alm_CL_target")
-    this%CL_target => neko_registry%get_real_scalar("alm_CL_target")
-
     call this%init_from_attributes(design, simulation, weight, name)
+
   end subroutine actuator_line_init_json_sim
 
   !> The actual constructor.
@@ -153,30 +139,25 @@ contains
     call this%init_base(name, design%size(), weight)
 
     ! Get the circulation distribution
-    call this%gamm%init(design%size())
+    call this%gamma_vec%init(design%size())
 
     select type (design)
     type is (actuator_line_design_t)
-       call design%get_values(this%gamm)
+       call design%get_values(this%gamma_vec)
+       this%lift_penalty_weight = design%lift_penalty_weight
+       this%CL_target = design%CL_target
 
     class default
        call neko_error('Actuator line objective only works with '// &
             'actuator_line_design')
     end select
 
-    this%u => neko_registry%get_field('u')
-    this%v => neko_registry%get_field('v')
-    this%w => neko_registry%get_field('w')
-
   end subroutine actuator_line_init_attributes
 
   !> Destructor.
   subroutine actuator_line_free(this)
     class(actuator_line_objective_t), intent(inout) :: this
-    this%u => null()
-    this%v => null()
-    this%w => null()
-    call this%gamm%free()
+    call this%gamma_vec%free()
     call this%free_base()
 
   end subroutine actuator_line_free
@@ -188,13 +169,16 @@ contains
     class(actuator_line_objective_t), intent(inout) :: this
     class(design_t), intent(in) :: design
 
+    integer :: alm_id
     real(kind=rp) :: lift, drag, lift_target 
     real(kind=rp), pointer :: force_nondim_factor
+    character(len=64) :: force_nondim_factor_name
 
     ! Get lift and drag coefficients
     select type (design)
     type is (actuator_line_design_t)
        call design%get_resultant_force(lift, drag)
+       alm_id = design%alm_id
 
     class default
        call neko_error('Actuator line objective only works with '// &
@@ -202,7 +186,8 @@ contains
     end select
 
     ! Objective: J = drag + (\beta / 2) (lift - lift_target)^2
-    force_nondim_factor => neko_registry%get_real_scalar("alm_force_nondim_factor")
+    write(force_nondim_factor_name, '("alm_", A, "_", I0)') "force_nondim_factor", alm_id
+    force_nondim_factor => neko_registry%get_real_scalar(force_nondim_factor_name)
     lift_target = this%CL_target / force_nondim_factor
     this%value = drag + 0.5_rp * this%lift_penalty_weight * (lift - lift_target)**2
 
