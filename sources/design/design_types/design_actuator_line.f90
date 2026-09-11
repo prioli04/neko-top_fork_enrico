@@ -203,7 +203,7 @@ contains
     call fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
 
     ! Init the actuator line term for the adjoint
-    call adjoint_source%init_from_components(fields_adjoint, simulation%adjoint_fluid%c_Xh, &
+    call adjoint_source%init_from_components(fields_adjoint, simulation%adjoint_fluid%c_Xh, this%interpolator, &
          simulation%adjoint_fluid%u_adj, simulation%adjoint_fluid%v_adj, simulation%adjoint_fluid%w_adj, &
          this%gamma_vec, lift_penalty_weight, CL_target, this%alm_id)
          

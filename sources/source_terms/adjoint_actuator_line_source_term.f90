@@ -44,11 +44,14 @@ module adjoint_actuator_line_source_term
   use time_state, only: time_state_t
   use source_term, only : source_term_t
   use coefs, only : coef_t
+  use global_interpolation, only : global_interpolation_t
   use matrix, only : matrix_t
   use vector, only : vector_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use device_math, only : device_rzero, device_glsc2
   use math, only : rzero, vcross, glsc2
+  use comm, only: NEKO_COMM, MPI_REAL_PRECISION, pe_rank
+  use mpi_f08, only: MPI_SUM, MPI_Allreduce, MPI_IN_PLACE
   implicit none
   private
   public :: adjoint_actuator_line_source_term_allocate
@@ -63,6 +66,8 @@ module adjoint_actuator_line_source_term
      type(field_t), pointer :: v_adj => null()
      !> w of the adjoint
      type(field_t), pointer :: w_adj => null()
+     !> Pointer to the interpolator object
+     type(global_interpolation_t), pointer :: interp => null()
      !> The penalty factor for the lift deviation.
      real(kind=rp) :: beta
      !> The lift deviation.
@@ -82,6 +87,9 @@ module adjoint_actuator_line_source_term
      !> Computes the source term and adds the result to `fields`.
      procedure, pass(this) :: compute_ => &
           adjoint_actuator_line_source_term_compute
+     !> Computes the adjoint of the interpolation operator
+     procedure, private, pass(this) :: adjoint_interpolation_compute
+
   end type adjoint_actuator_line_source_term_t
 
 contains
@@ -116,11 +124,12 @@ contains
   !! @param w_adj Z component of the adjoint velocity field.
   !! @param gamma_vec The design circulation vector.
   !! @param alm_id Actuator line id.
-  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, u_adj, v_adj, w_adj, gamma_vec,&
+  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, interp, u_adj, v_adj, w_adj, gamma_vec,&
     beta, CL_target, alm_id)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
+    type(global_interpolation_t), target, intent(in) :: interp
     type(field_t), intent(in), target :: u_adj, v_adj, w_adj
     real(kind=rp), allocatable, intent(in) :: gamma_vec(:)
     real(kind=rp), intent(in) :: beta
@@ -142,6 +151,7 @@ contains
     this%u_adj => u_adj
     this%v_adj => v_adj
     this%w_adj => w_adj
+    this%interp => interp
     this%gamma_vec = gamma_vec
     this%beta = beta
     this%alm_id = alm_id
@@ -165,6 +175,7 @@ contains
     nullify(this%u_adj)
     nullify(this%v_adj)
     nullify(this%w_adj)
+    nullify(this%interp)
     call this%free_base()
 
   end subroutine adjoint_actuator_line_source_term_free
@@ -177,7 +188,7 @@ contains
     type(time_state_t), intent(in) :: time
     
     integer :: n_alm, n_dof, j, temp_index
-    type(field_t), pointer :: fu, fv, fw, temp_kernel
+    type(field_t), pointer :: temp_kernel
     type(matrix_t), pointer :: kernel
     character(len=64) :: kernel_name
 
@@ -205,22 +216,6 @@ contains
     ! Get kernel values
     write(kernel_name, '("alm_", A, "_", I0)') "kernel", this%alm_id
     kernel => neko_registry%get_matrix(kernel_name)
-    
-    ! Get adjoint RHS fields
-    fu => this%fields%get_by_index(1)
-    fv => this%fields%get_by_index(2)
-    fw => this%fields%get_by_index(3)
-
-    ! Clear old source terms
-    if (NEKO_BCKND_DEVICE .eq. 1) then
-      call device_rzero(fu%x_d, n_dof)
-      call device_rzero(fv%x_d, n_dof)
-      call device_rzero(fw%x_d, n_dof)
-    else
-      call rzero(fu%x, n_dof)
-      call rzero(fv%x, n_dof)
-      call rzero(fw%x, n_dof)
-    end if
 
     ! Update source terms
     call vcross(gamma_ex_x, gamma_ex_y, gamma_ex_z, zero_vec, this%gamma_vec, zero_vec, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of gamma and x direction
@@ -246,6 +241,11 @@ contains
       end do
     end if
 
+    ! Sum contributions from other ranks
+    call MPI_Allreduce(MPI_IN_PLACE, conv_x, n_alm, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
+    call MPI_Allreduce(MPI_IN_PLACE, conv_y, n_alm, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
+    call MPI_Allreduce(MPI_IN_PLACE, conv_z, n_alm, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
+
     ! Cross product of gamma and volumetric convolution
     call vcross(gamma_conv_x, gamma_conv_y, gamma_conv_z, zero_vec, this%gamma_vec, zero_vec, conv_x, conv_y, conv_z, n_alm) 
     
@@ -254,10 +254,113 @@ contains
     f_dagger(:, 2) = gamma_conv_y - gamma_ex_y - this%beta * this%delta_L * gamma_ez_y
     f_dagger(:, 3) = gamma_conv_z - gamma_ex_z - this%beta * this%delta_L * gamma_ez_z
 
-    print *, f_dagger(:, 1)
-    print *, f_dagger(:, 2)
-    print *, f_dagger(:, 3)
+    ! Perform the interpolation adjoint (scattering operation) only if the calling rank has points to interpolate
+    call this%adjoint_interpolation_compute(f_dagger, n_alm)
+
+    if (pe_rank .eq. 0) then
+      print *, f_dagger(:, 1)
+      print *, f_dagger(:, 2)
+      print *, f_dagger(:, 3)
+    end if
 
   end subroutine adjoint_actuator_line_source_term_compute
+
+  !> Computes the adjoint of the interpolation operator.
+  !! @param this The object.
+  !! @param f_dagger The actuator line localized adjoint forcing
+  !! @param n_alm Number of actuator line segments
+  subroutine adjoint_interpolation_compute(this, f_dagger, n_alm)
+    class(adjoint_actuator_line_source_term_t), intent(inout) :: this
+    integer, intent(in) :: n_alm
+    real(kind=rp), intent(in) :: f_dagger(n_alm, 3)
+    
+    type(field_t), pointer :: fu, fv, fw
+    real(kind=rp) :: weight
+    real(kind=rp), allocatable :: f_dagger_local(:,:)
+    integer :: p, p_glb, e, n_dof
+    integer :: i, j, k
+    integer :: rank, n
+    integer, pointer :: dof_ids(:), ids(:), p_glb_ids(:)
+
+    n_dof = this%fields%item_size(1)
+
+    ! Get adjoint RHS fields
+    fu => this%fields%get_by_index(1)
+    fv => this%fields%get_by_index(2)
+    fw => this%fields%get_by_index(3)
+
+    ! Clear old source terms
+    call rzero(fu%x, n_dof)
+    call rzero(fv%x, n_dof)
+    call rzero(fw%x, n_dof)
+
+    ! Only proceed with the interpolation adjoint if the calling rank has points to interpolate
+    if (this%interp%n_points_local > 0) then
+      ! Allocate the forcing terms local to this rank
+      allocate(f_dagger_local(this%interp%n_points_local, 3))
+      p_glb_ids => this%interp%glb_intrp_comm%recv_dof(pe_rank)%array()
+
+      ! print *, "Total points: ", this%interp%n_points
+      ! print *, "rank :", pe_rank, "; local points:", this%interp%n_points_local
+
+      do p = 1, this%interp%glb_intrp_comm%recv_dof(pe_rank)%size()
+        ! print *, "global id: ", p_glb_ids(p)
+        p_glb = p_glb_ids(p)
+        f_dagger_local(p, :) = f_dagger(p_glb, :)
+      end do
+
+      do p = 1, this%interp%n_points_local
+        e = this%interp%el_owner0_local(p) + 1
+
+        do k = 1, this%interp%Xh%lz
+          do j = 1, this%interp%Xh%ly
+            do i = 1, this%interp%Xh%lx
+              weight = this%interp%local_interp%weights_r(i, p) * &
+                      this%interp%local_interp%weights_s(j, p) * &
+                      this%interp%local_interp%weights_t(k, p)
+
+              fu%x(i, j, k, e) = fu%x(i, j, k, e) + weight * f_dagger_local(p, 1)
+              fv%x(i, j, k, e) = fv%x(i, j, k, e) + weight * f_dagger_local(p, 2)
+              fw%x(i, j, k, e) = fw%x(i, j, k, e) + weight * f_dagger_local(p, 3)
+            end do
+          end do
+        end do
+      end do
+
+      ! Copy forcing to the device
+      if (NEKO_BCKND_DEVICE .eq. 1) then
+        call device_memcpy(fu%x, fu%x_d, n_dof, HOST_TO_DEVICE, .true.)
+        call device_memcpy(fv%x, fv%x_d, n_dof, HOST_TO_DEVICE, .true.)
+        call device_memcpy(fw%x, fw%x_d, n_dof, HOST_TO_DEVICE, .true.)
+      end if
+    end if
+
+    ! if (pe_rank == 0) then
+    !   do rank = 0, size(this%interp%glb_intrp_comm%recv_dof) - 1
+    !     n = this%interp%glb_intrp_comm%recv_dof(rank)%size()
+
+    !     if (n > 0) then
+    !       ids => this%interp%glb_intrp_comm%recv_dof(rank)%array()
+    !       print *, 'rank', rank, 'recv:', ids(1:n)
+    !     end if
+    !   end do
+
+    !   do rank = 0, size(this%interp%glb_intrp_comm%send_dof) - 1
+    !     n = this%interp%glb_intrp_comm%send_dof(rank)%size()
+
+    !     if (n > 0) then
+    !       ids => this%interp%glb_intrp_comm%send_dof(rank)%array()
+    !       print *, 'rank', rank, 'send:', ids(1:n)
+    !     end if
+    !   end do
+
+    !   do p = 1, this%interp%n_points
+    !     print *, 'actuator point', p, &
+    !             'owner rank', this%interp%pe_owner(p), &
+    !             'owner element', this%interp%el_owner0(p) + 1
+    !   end do
+    ! end if
+
+  end subroutine adjoint_interpolation_compute
 
 end module adjoint_actuator_line_source_term
