@@ -551,8 +551,10 @@ contains
     real(kind=rp) :: total_time
     integer :: i
     type(time_state_t) :: accumulation_time
+    type(json_file) :: time_params
 
-    call dt_controller%init(simulation%neko_case%params)
+    call json_get(simulation%neko_case%params, 'case.time', time_params)
+    call dt_controller%init(time_params)
 
     call simulation_adjoint_init(simulation%adjoint_case, dt_controller)
 
