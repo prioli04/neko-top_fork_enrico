@@ -49,8 +49,8 @@ module adjoint_actuator_line_source_term
   use matrix, only : matrix_t
   use vector, only : vector_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
-  use device_math, only : device_rzero, device_glsc2
-  use math, only : rzero, vcross, glsc2
+  use device_math, only : device_rzero, device_glsc3
+  use math, only : rzero, vcross, glsc3
   use comm, only: NEKO_COMM, MPI_REAL_PRECISION, pe_rank
   use mpi_f08, only: MPI_SUM, MPI_Allreduce, MPI_IN_PLACE
   implicit none
@@ -227,24 +227,19 @@ contains
 
       do j = 1, n_alm
         call device_memcpy(kernel%x(:,j), temp_kernel%x_d, n_dof, HOST_TO_DEVICE, sync=.true.)
-        conv_x(j) = device_glsc2(this%u_adj%x_d, temp_kernel%x_d, n_dof)
-        conv_y(j) = device_glsc2(this%v_adj%x_d, temp_kernel%x_d, n_dof)
-        conv_z(j) = device_glsc2(this%w_adj%x_d, temp_kernel%x_d, n_dof)
+        conv_x(j) = device_glsc3(this%u_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
+        conv_y(j) = device_glsc3(this%v_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
+        conv_z(j) = device_glsc3(this%w_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
       end do
 
       call neko_scratch_registry%relinquish_field(temp_index)
     else
       do j = 1, n_alm
-        conv_x(j) = glsc2(this%u_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
-        conv_y(j) = glsc2(this%v_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
-        conv_z(j) = glsc2(this%w_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+        conv_x(j) = glsc3(this%u_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
+        conv_y(j) = glsc3(this%v_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
+        conv_z(j) = glsc3(this%w_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
       end do
     end if
-
-    ! Sum contributions from other ranks
-    ! call MPI_Allreduce(MPI_IN_PLACE, conv_x, n_alm, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
-    ! call MPI_Allreduce(MPI_IN_PLACE, conv_y, n_alm, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
-    ! call MPI_Allreduce(MPI_IN_PLACE, conv_z, n_alm, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
 
     ! Cross product of gamma and volumetric convolution
     call vcross(gamma_conv_x, gamma_conv_y, gamma_conv_z, zero_vec, this%gamma_vec, zero_vec, conv_x, conv_y, conv_z, n_alm) 
@@ -258,9 +253,9 @@ contains
     call this%adjoint_interpolation_compute(f_dagger, n_alm)
 
     if (pe_rank .eq. 0) then
-      print *, f_dagger(:, 1)
-      print *, f_dagger(:, 2)
-      print *, f_dagger(:, 3)
+      print *, "f_adj_x: ", f_dagger(:, 1)
+      print *, "f_adj_y: ", f_dagger(:, 2)
+      print *, "f_adj_z: ", f_dagger(:, 3)
     end if
 
   end subroutine adjoint_actuator_line_source_term_compute
@@ -279,7 +274,7 @@ contains
     real(kind=rp), allocatable :: f_dagger_local(:,:)
     integer :: p, p_glb, e, n_dof
     integer :: i, j, k
-    integer :: rank, n
+    integer :: rank, n, recv_size
     integer, pointer :: dof_ids(:), ids(:), p_glb_ids(:)
 
     n_dof = this%fields%item_size(1)
@@ -296,20 +291,19 @@ contains
 
     ! Only proceed with the interpolation adjoint if the calling rank has points to interpolate
     if (this%interp%n_points_local > 0) then
+
+      recv_size = this%interp%glb_intrp_comm%recv_dof(pe_rank)%size()
+      
       ! Allocate the forcing terms local to this rank
-      allocate(f_dagger_local(this%interp%n_points_local, 3))
+      allocate(f_dagger_local(recv_size, 3))
       p_glb_ids => this%interp%glb_intrp_comm%recv_dof(pe_rank)%array()
 
-      ! print *, "Total points: ", this%interp%n_points
-      ! print *, "rank :", pe_rank, "; local points:", this%interp%n_points_local
-
       do p = 1, this%interp%glb_intrp_comm%recv_dof(pe_rank)%size()
-        ! print *, "global id: ", p_glb_ids(p)
         p_glb = p_glb_ids(p)
         f_dagger_local(p, :) = f_dagger(p_glb, :)
       end do
 
-      do p = 1, this%interp%n_points_local
+      do p = 1, recv_size
         e = this%interp%el_owner0_local(p) + 1
 
         do k = 1, this%interp%Xh%lz
@@ -318,6 +312,13 @@ contains
               weight = this%interp%local_interp%weights_r(i, p) * &
                       this%interp%local_interp%weights_s(j, p) * &
                       this%interp%local_interp%weights_t(k, p)
+
+              write(*,'(a,i0,a,5(i0,1x),a,es16.8,a,3(es16.8,1x))') &
+                'rank=', pe_rank, ' (p,e,i,j,k)=', p, e, i, j, k, &
+                ' weight=', weight, ' xyz=', &
+                this%coef%dof%x(i,j,k,e), &
+                this%coef%dof%y(i,j,k,e), &
+                this%coef%dof%z(i,j,k,e)
 
               fu%x(i, j, k, e) = fu%x(i, j, k, e) + weight * f_dagger_local(p, 1)
               fv%x(i, j, k, e) = fv%x(i, j, k, e) + weight * f_dagger_local(p, 2)
@@ -334,32 +335,6 @@ contains
         call device_memcpy(fw%x, fw%x_d, n_dof, HOST_TO_DEVICE, .true.)
       end if
     end if
-
-    ! if (pe_rank == 0) then
-    !   do rank = 0, size(this%interp%glb_intrp_comm%recv_dof) - 1
-    !     n = this%interp%glb_intrp_comm%recv_dof(rank)%size()
-
-    !     if (n > 0) then
-    !       ids => this%interp%glb_intrp_comm%recv_dof(rank)%array()
-    !       print *, 'rank', rank, 'recv:', ids(1:n)
-    !     end if
-    !   end do
-
-    !   do rank = 0, size(this%interp%glb_intrp_comm%send_dof) - 1
-    !     n = this%interp%glb_intrp_comm%send_dof(rank)%size()
-
-    !     if (n > 0) then
-    !       ids => this%interp%glb_intrp_comm%send_dof(rank)%array()
-    !       print *, 'rank', rank, 'send:', ids(1:n)
-    !     end if
-    !   end do
-
-    !   do p = 1, this%interp%n_points
-    !     print *, 'actuator point', p, &
-    !             'owner rank', this%interp%pe_owner(p), &
-    !             'owner element', this%interp%el_owner0(p) + 1
-    !   end do
-    ! end if
 
   end subroutine adjoint_interpolation_compute
 

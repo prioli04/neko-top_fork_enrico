@@ -65,6 +65,8 @@ module actuator_line_design
      real(kind=rp), allocatable :: sensitivity(:)
      !> Global interpolation object
      type(global_interpolation_t) :: interpolator
+     type(field_list_t) :: fields_forward
+     type(field_list_t) :: fields_adjoint
      !> u of the adjoint
      type(field_t), pointer :: u_adj => null()
      !> v of the adjoint
@@ -167,7 +169,7 @@ contains
 
   end subroutine actuator_line_design_free
 
-    subroutine actuator_line_design_init_from_components(this, name, simulation, N, lift_penalty_weight, CL_target, V_inf, b, AR, &
+  subroutine actuator_line_design_init_from_components(this, name, simulation, N, lift_penalty_weight, CL_target, V_inf, b, AR, &
       eps, x_center, y_center, z_center, gamma_vec)
     class(actuator_line_design_t), target, intent(inout) :: this
     character(len=*), intent(in) :: name
@@ -186,7 +188,6 @@ contains
 
     type(actuator_line_source_term_t) :: forward_source
     type(adjoint_actuator_line_source_term_t) :: adjoint_source
-    type(field_list_t) :: fields_forward, fields_adjoint
     real(kind=rp) :: force_nondim_factor
 
     call this%init_base(name, N)
@@ -197,16 +198,16 @@ contains
     this%w_adj => simulation%adjoint_fluid%w_adj
 
     ! Init list of source fields used for initializing Neko's sources
-    call fields_forward%init(3)
-    call fields_forward%assign(1, simulation%fluid%f_x)
-    call fields_forward%assign(2, simulation%fluid%f_y)
-    call fields_forward%assign(3, simulation%fluid%f_z)
+    call this%fields_forward%init(3)
+    call this%fields_forward%assign(1, simulation%fluid%f_x)
+    call this%fields_forward%assign(2, simulation%fluid%f_y)
+    call this%fields_forward%assign(3, simulation%fluid%f_z)
 
     ! Init interpolator
     call this%interpolator%init(simulation%fluid%u%dof)
 
     ! Init the actuator line term for the forward problem
-    call forward_source%init_from_components(fields_forward, simulation%fluid%c_Xh, N, CL_target, &
+    call forward_source%init_from_components(this%fields_forward, simulation%fluid%c_Xh, N, CL_target, &
       V_inf, b, AR, eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id, force_nondim_factor)
     
     this%L_target = CL_target / force_nondim_factor
@@ -215,13 +216,13 @@ contains
     call simulation%fluid%source_term%add(forward_source)
 
     ! Init list of source fields used for initializing the adjoint source
-    call fields_adjoint%init(3)
-    call fields_adjoint%assign(1, simulation%adjoint_fluid%f_adj_x)
-    call fields_adjoint%assign(2, simulation%adjoint_fluid%f_adj_y)
-    call fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
+    call this%fields_adjoint%init(3)
+    call this%fields_adjoint%assign(1, simulation%adjoint_fluid%f_adj_x)
+    call this%fields_adjoint%assign(2, simulation%adjoint_fluid%f_adj_y)
+    call this%fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
 
     ! Init the actuator line term for the adjoint
-    call adjoint_source%init_from_components(fields_adjoint, simulation%adjoint_fluid%c_Xh, this%interpolator, &
+    call adjoint_source%init_from_components(this%fields_adjoint, simulation%adjoint_fluid%c_Xh, this%interpolator, &
          simulation%adjoint_fluid%u_adj, simulation%adjoint_fluid%v_adj, simulation%adjoint_fluid%w_adj, &
          this%gamma_vec, lift_penalty_weight, this%L_target, this%alm_id)
          
@@ -247,7 +248,7 @@ contains
        call neko_error('Get design: size mismatch')
     end if
 
-    call copy(values%x, this%gamma_vec, size(this%gamma_vec))
+    values%x = this%gamma_vec
 
   end subroutine actuator_line_design_get_design
 
@@ -285,7 +286,7 @@ contains
        call neko_error('Get sensitivity: size mismatch')
     end if
 
-    call copy(values%x, this%sensitivity, size(this%gamma_vec))
+    values%x = this%sensitivity
 
   end subroutine actuator_line_design_get_sensitivity
 
@@ -349,7 +350,7 @@ contains
        call device_memcpy(values%x, values%x_d, size(this%gamma_vec), DEVICE_TO_HOST, .true.)
     end if
 
-    call copy(this%gamma_vec, values%x, size(this%gamma_vec))
+    this%gamma_vec = values%x
 
   end subroutine actuator_line_design_update_design
 

@@ -60,10 +60,11 @@ module actuator_line_objective
   use registry, only: neko_registry
   use space, only: space_t, GL
   use coefs, only: coef_t
-  use math, only: vcross, glsc2, copy, col2, invcol2
-  use device_math, only: device_copy, device_glsc2, device_col2, device_invcol2
+  use math, only: vcross, glsc3, copy, col2, invcol2
+  use device_math, only: device_copy, device_glsc3, device_col2, device_invcol2
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use continuation_scheduler, only: nekotop_continuation
+  use comm, only: pe_rank
   implicit none
   private
 
@@ -78,6 +79,8 @@ module actuator_line_objective
      real(kind=rp) :: lift_penalty_weight
      !> target lift coefficient
      real(kind=rp) :: L_target
+     !> Coefficients for the SEM.
+     type(coef_t), pointer :: coef => null()
 
    contains
 
@@ -137,11 +140,13 @@ contains
     type(adjoint_actuator_line_source_term_t) :: actuator_line_adjoint_source
 
     ! Call the base initializer
-    print *, design%size()
     call this%init_base(name, design%size(), weight)
 
     ! Get the circulation distribution
     call this%gamma_vec%init(design%size())
+
+    ! Get adjoint mass matrix coefficients
+    this%coef => simulation%adjoint_case%fluid_adj%c_Xh
 
     select type (design)
     type is (actuator_line_design_t)
@@ -189,9 +194,10 @@ contains
 
     ! Objective: J = drag + (\beta / 2) (lift - lift_target)^2
     this%value = drag + 0.5_rp * this%lift_penalty_weight * (lift - this%L_target)**2
-
-    print *, "actuator_line_update_value"
-    print *, this%value
+    print *, "Drag", drag
+    print *, "Lift", lift
+    print *, "Objective value", this%value
+    print *, "Objective weight", this%weight
 
   end subroutine actuator_line_update_value
 
@@ -261,17 +267,17 @@ contains
 
       do j = 1, n_alm
         call device_memcpy(kernel%x(:,j), temp_kernel%x_d, n_dof, HOST_TO_DEVICE, sync=.true.)
-        conv_x(j) = device_glsc2(u_adj%x_d, temp_kernel%x_d, n_dof)
-        conv_y(j) = device_glsc2(v_adj%x_d, temp_kernel%x_d, n_dof)
-        conv_z(j) = device_glsc2(w_adj%x_d, temp_kernel%x_d, n_dof)
+        conv_x(j) = device_glsc3(u_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
+        conv_y(j) = device_glsc3(v_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
+        conv_z(j) = device_glsc3(w_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
       end do
 
       call neko_scratch_registry%relinquish_field(temp_index)
     else
       do j = 1, n_alm
-        conv_x(j) = glsc2(u_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
-        conv_y(j) = glsc2(v_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
-        conv_z(j) = glsc2(w_adj%x(:,1,1,1), kernel%x(:,j), n_dof)
+        conv_x(j) = glsc3(u_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
+        conv_y(j) = glsc3(v_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
+        conv_z(j) = glsc3(w_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
       end do
     end if
 
@@ -283,6 +289,12 @@ contains
     grad(:, 1) = velinterp_conv_x - velinterp_ex_x - this%lift_penalty_weight * delta_L * velinterp_ez_x
     grad(:, 2) = velinterp_conv_y - velinterp_ex_y - this%lift_penalty_weight * delta_L * velinterp_ez_y
     grad(:, 3) = velinterp_conv_z - velinterp_ex_z - this%lift_penalty_weight * delta_L * velinterp_ez_z
+
+    if (pe_rank .eq. 0) then
+      print *, "delta_L: ", delta_L
+      print *, "u_dagger * eta: ", velinterp_conv_y
+      print *, "gradient: ", grad(:, 2)
+    end if
 
     ! Take only y-component perturbations for now
     if (NEKO_BCKND_DEVICE .eq. 1) then
