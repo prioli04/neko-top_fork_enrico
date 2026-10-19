@@ -5,16 +5,16 @@
         "output_directory": "output",
         "output_boundary": false,
         "output_checkpoints": false,
-        "output_at_end": false,
+        "output_at_end": true,
         "time": {
             "end_time": 10.0,
-            "timestep": 1e-2,
-            "variable_timestep": true,
+            "timestep": 1.5e-2,
+            "variable_timestep": false,
             "target_cfl": 0.4
         },
         "numerics": {
             "time_order": 3,
-            "polynomial_order": 3,
+            "polynomial_order": 5,
             "dealias": false
         },
         "adjoint_fluid": {
@@ -26,7 +26,7 @@
                 {
                     "type": "velocity_value",
                     "zone_indices": [ 1 ],
-		            "value": [ 1.0, 0.0, 0.0 ]
+		            "value": [ 0.0, 0.0, 0.0 ]
                 },
                 {
                     "type": "outflow",
@@ -79,7 +79,7 @@
         "design": {
             "type": "actuator_line",
             "N": 10,
-            "lift_penalty_weight": 100.0,
+            "lift_penalty_weight": 0.0,
             "CL_target": 0.5,
             "V_inf": 1.0,
             "b": 2.0,
@@ -111,7 +111,7 @@
         },
         "objectives": [
             {
-                "type": "actuator_line",
+                "type": "drag_lift_deviation",
                 "weight": 1.0
             }
         ]

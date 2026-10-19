@@ -38,7 +38,9 @@ submodule(neko_top) neko_top_source_terms
 
   ! Our user-defined source terms
   use adjoint_actuator_line_source_term, only: &
-       adjoint_actuator_line_source_term_allocate
+       adjoint_actuator_line_source_term_allocate  
+  use adjoint_drag_lift_deviation_source_term, only: &
+       adjoint_drag_lift_deviation_source_term_allocate
   use adjoint_brinkman_dissipation_source_term, only: &
        adjoint_brinkman_dissipation_source_term_allocate
   use adjoint_viscous_dissipation_source_term, only: &
@@ -54,6 +56,7 @@ contains
   !> @brief Register the known source terms from Neko-TOP in the Neko system.
   module subroutine register_source_terms()
     procedure(source_term_allocate), pointer :: adjoint_actuator_line
+    procedure(source_term_allocate), pointer :: adjoint_drag_lift_deviation
     procedure(source_term_allocate), pointer :: adjoint_brinkman_dissipation
     procedure(source_term_allocate), pointer :: adjoint_viscous_dissipation
     procedure(source_term_allocate), pointer :: adjoint_mixing_scalar
@@ -62,6 +65,7 @@ contains
 
     ! Assign the pointers
     adjoint_actuator_line => adjoint_actuator_line_source_term_allocate
+    adjoint_drag_lift_deviation => adjoint_drag_lift_deviation_source_term_allocate
     adjoint_brinkman_dissipation => &
          adjoint_brinkman_dissipation_source_term_allocate
     adjoint_viscous_dissipation => &
@@ -72,7 +76,9 @@ contains
 
     ! Register the source terms
     call register_source_term('adjoint_actuator_line', &
-         adjoint_actuator_line)
+         adjoint_actuator_line)    
+     call register_source_term('adjoint_drag_lift_deviation', &
+         adjoint_drag_lift_deviation)
     call register_source_term('adjoint_brinkman_dissipation', &
          adjoint_brinkman_dissipation)
     call register_source_term('adjoint_viscous_dissipation', &

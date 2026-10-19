@@ -47,12 +47,10 @@ module adjoint_actuator_line_source_term
   use coefs, only : coef_t
   use global_interpolation, only : global_interpolation_t
   use matrix, only : matrix_t
-  use vector, only : vector_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use device_math, only : device_rzero, device_glsc3
   use math, only : rzero, vcross, glsc3
-  use comm, only: NEKO_COMM, MPI_REAL_PRECISION, pe_rank
-  use mpi_f08, only: MPI_SUM, MPI_Allreduce, MPI_IN_PLACE
+  use comm, only: pe_rank
   implicit none
   private
   public :: adjoint_actuator_line_source_term_allocate
@@ -69,10 +67,6 @@ module adjoint_actuator_line_source_term
      type(field_t), pointer :: w_adj => null()
      !> Pointer to the interpolator object
      type(global_interpolation_t), pointer :: interp => null()
-     !> The penalty factor for the lift deviation.
-     real(kind=rp) :: beta
-     !> The target lift.
-     real(kind=rp) :: L_target
      !> Actuator line instance id
      integer :: alm_id
 
@@ -124,19 +118,15 @@ contains
   !! @param v_adj Y component of the adjoint velocity field.
   !! @param w_adj Z component of the adjoint velocity field.
   !! @param gamma_vec The design circulation vector.
-  !! @param beta Lift deviation penalty factor.
-  !! @param L_target Target lift.
   !! @param alm_id Actuator line id.
   subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, interp, u_adj, v_adj, w_adj, gamma_vec,&
-    beta, L_target, alm_id)
+    alm_id)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
     type(global_interpolation_t), target, intent(in) :: interp
     type(field_t), intent(in), target :: u_adj, v_adj, w_adj
     real(kind=rp), allocatable, intent(in) :: gamma_vec(:)
-    real(kind=rp), intent(in) :: beta
-    real(kind=rp), intent(in) :: L_target
     integer, intent(in) :: alm_id
 
     real(kind=rp) :: start_time, end_time
@@ -153,8 +143,6 @@ contains
     this%w_adj => w_adj
     this%interp => interp
     this%gamma_vec = gamma_vec
-    this%beta = beta
-    this%L_target = L_target
     this%alm_id = alm_id
 
   end subroutine adjoint_actuator_line_source_term_init_from_components
@@ -183,25 +171,17 @@ contains
     integer :: n_alm, n_dof, j, temp_index
     type(field_t), pointer :: temp_kernel
     type(matrix_t), pointer :: kernel
-    type(vector_t), pointer :: resultant_force
-    character(len=64) :: kernel_name, resultant_force_name
+    character(len=64) :: kernel_name
 
-    real(kind=rp), allocatable :: gamma_ex_x(:), gamma_ex_y(:), gamma_ex_z(:)
-    real(kind=rp), allocatable :: gamma_ez_x(:), gamma_ez_y(:), gamma_ez_z(:)
     real(kind=rp), allocatable :: conv_x(:), conv_y(:), conv_z(:)
-    real(kind=rp), allocatable :: gamma_conv_x(:), gamma_conv_y(:), gamma_conv_z(:)
     real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
     real(kind=rp), allocatable :: f_dagger(:, :)
-    real(kind=rp) :: delta_L
 
     n_alm = size(this%gamma_vec)
     n_dof = this%fields%item_size(1)
 
     ! Allocate arrays
-    allocate(gamma_ex_x(n_alm), gamma_ex_y(n_alm), gamma_ex_z(n_alm))
-    allocate(gamma_ez_x(n_alm), gamma_ez_y(n_alm), gamma_ez_z(n_alm))
     allocate(conv_x(n_alm), conv_y(n_alm), conv_z(n_alm))
-    allocate(gamma_conv_x(n_alm), gamma_conv_y(n_alm), gamma_conv_z(n_alm))
     allocate(zero_vec(n_alm), one_vec(n_alm))
     allocate(f_dagger(n_alm, 3))
 
@@ -211,15 +191,6 @@ contains
     ! Get kernel values
     kernel_name = make_registry_name("kernel", this%alm_id)
     kernel => neko_registry%get_matrix(kernel_name)
-
-    ! Compute lift deviation
-    resultant_force_name = make_registry_name("resultant_force", this%alm_id)
-    resultant_force => neko_registry%get_vector(resultant_force_name)
-    delta_L = resultant_force%x(1) - this%L_target
-
-    ! Update source terms
-    call vcross(gamma_ex_x, gamma_ex_y, gamma_ex_z, zero_vec, this%gamma_vec, zero_vec, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of gamma and x direction
-    call vcross(gamma_ez_x, gamma_ez_y, gamma_ez_z, zero_vec, this%gamma_vec, zero_vec, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of gamma and z direction
 
     ! Volumetric convolution of the adjoint velocity with the gaussian kernel
     if (NEKO_BCKND_DEVICE .eq. 1) then
@@ -241,21 +212,16 @@ contains
       end do
     end if
 
-    ! Cross product of gamma and volumetric convolution
-    call vcross(gamma_conv_x, gamma_conv_y, gamma_conv_z, zero_vec, this%gamma_vec, zero_vec, conv_x, conv_y, conv_z, n_alm) 
-    
     ! Compute adjoint point forcing
-    f_dagger(:, 1) = gamma_conv_x - gamma_ex_x - this%beta * delta_L * gamma_ez_x
-    f_dagger(:, 2) = gamma_conv_y - gamma_ex_y - this%beta * delta_L * gamma_ez_y
-    f_dagger(:, 3) = gamma_conv_z - gamma_ex_z - this%beta * delta_L * gamma_ez_z
+    call vcross(f_dagger(:, 1), f_dagger(:, 2), f_dagger(:, 3), zero_vec, this%gamma_vec, zero_vec, conv_x, conv_y, conv_z, n_alm) 
 
     ! Perform the interpolation adjoint (scattering operation) only if the calling rank has points to interpolate
     call this%adjoint_interpolation_compute(f_dagger, n_alm)
 
     if (pe_rank .eq. 0) then
-      print *, "f_adj_x: ", f_dagger(:, 1)
-      print *, "f_adj_y: ", f_dagger(:, 2)
-      print *, "f_adj_z: ", f_dagger(:, 3)
+      print *, "alm f_adj_x: ", f_dagger(:, 1)
+      print *, "alm f_adj_y: ", f_dagger(:, 2)
+      print *, "alm f_adj_z: ", f_dagger(:, 3)
     end if
 
   end subroutine adjoint_actuator_line_source_term_compute
@@ -274,8 +240,10 @@ contains
     real(kind=rp), allocatable :: f_dagger_local(:,:)
     integer :: p, p_glb, e, n_dof
     integer :: i, j, k
-    integer :: rank, n, recv_size
-    integer, pointer :: dof_ids(:), ids(:), p_glb_ids(:)
+    ! integer :: rank, n, recv_size
+    integer :: recv_size
+    ! integer, pointer :: dof_ids(:), ids(:), p_glb_ids(:)
+    integer, pointer :: p_glb_ids(:)
 
     n_dof = this%fields%item_size(1)
 
@@ -283,11 +251,6 @@ contains
     fu => this%fields%get_by_index(1)
     fv => this%fields%get_by_index(2)
     fw => this%fields%get_by_index(3)
-
-    ! Clear old source terms
-    call rzero(fu%x, n_dof)
-    call rzero(fv%x, n_dof)
-    call rzero(fw%x, n_dof)
 
     ! Only proceed with the interpolation adjoint if the calling rank has points to interpolate
     if (this%interp%n_points_local > 0) then
@@ -313,12 +276,12 @@ contains
                       this%interp%local_interp%weights_s(j, p) * &
                       this%interp%local_interp%weights_t(k, p)
 
-              write(*,'(a,i0,a,5(i0,1x),a,es16.8,a,3(es16.8,1x))') &
-                'rank=', pe_rank, ' (p,e,i,j,k)=', p, e, i, j, k, &
-                ' weight=', weight, ' xyz=', &
-                this%coef%dof%x(i,j,k,e), &
-                this%coef%dof%y(i,j,k,e), &
-                this%coef%dof%z(i,j,k,e)
+              ! write(*,'(a,i0,a,5(i0,1x),a,es16.8,a,3(es16.8,1x))') &
+              !   'rank=', pe_rank, ' (p,e,i,j,k)=', p, e, i, j, k, &
+              !   ' weight=', weight, ' xyz=', &
+              !   this%coef%dof%x(i,j,k,e), &
+              !   this%coef%dof%y(i,j,k,e), &
+              !   this%coef%dof%z(i,j,k,e)
 
               fu%x(i, j, k, e) = fu%x(i, j, k, e) + weight * f_dagger_local(p, 1)
               fv%x(i, j, k, e) = fv%x(i, j, k, e) + weight * f_dagger_local(p, 2)

@@ -41,7 +41,7 @@ submodule (objective) objective_factory_mod
   use viscous_dissipation_objective, only: viscous_dissipation_objective_t
   use brinkman_dissipation_objective, only: brinkman_dissipation_objective_t
   use scalar_mixing_objective, only: scalar_mixing_objective_t
-  use actuator_line_objective, only: actuator_line_objective_t
+  use drag_lift_deviation_objective, only: drag_lift_deviation_objective_t
 
   implicit none
 
@@ -50,7 +50,7 @@ submodule (objective) objective_factory_mod
        "viscous_dissipation", &
        "scalar_mixing", &
        "brinkman_dissipation", &
-       "actuator_line"]
+       "drag_lift_deviation"]
 
 contains
 
@@ -78,8 +78,8 @@ contains
        allocate(scalar_mixing_objective_t::object)
     case ("brinkman_dissipation")
        allocate(brinkman_dissipation_objective_t::object)
-    case ("actuator_line")
-      allocate(actuator_line_objective_t::object)
+    case ("drag_lift_deviation")
+      allocate(drag_lift_deviation_objective_t::object)
     case default
        call neko_type_error("Objective", type, KNOWN_TYPES)
     end select

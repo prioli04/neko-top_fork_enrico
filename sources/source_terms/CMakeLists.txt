@@ -15,4 +15,5 @@ target_sources(neko-top PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/adjoint_mixing_scalar_source_term.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/adjoint_scalar_convection_source_term.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/adjoint_actuator_line_source_term.f90
+        ${CMAKE_CURRENT_SOURCE_DIR}/adjoint_drag_lift_deviation_source_term.f90
 )
