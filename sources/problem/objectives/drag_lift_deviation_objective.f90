@@ -34,7 +34,7 @@
 !
 !> Implements the `drag_lift_deviation_objective_t` type.
 !
-! J = CD + (\beta / 2) (CL - {CL_target})^2
+! J = D_ind + (\beta / 2) (L - {L_target})^2
 !
 module drag_lift_deviation_objective
   use global_interpolation, only: global_interpolation_t
@@ -54,7 +54,7 @@ module drag_lift_deviation_objective
   use neko_config, only: NEKO_BCKND_DEVICE
   use utils, only: neko_error
   use json_module, only: json_file
-  use json_utils, only: json_get_or_default
+  use json_utils, only: json_get_or_default, json_get
   use registry, only: neko_registry
   use registry, only: neko_registry
   use coefs, only: coef_t
@@ -67,7 +67,7 @@ module drag_lift_deviation_objective
   private
 
   !> An objective function corresponding to drag plus a quadratic lift deviation penalty
-  !! \f$ J = CD + (\beta / 2) (CL - {CL_target})^2 \f$
+  !! \f$ J = D_ind + (\beta / 2) (L - {L_target})^2 \f$
   type, public, extends(objective_t) :: drag_lift_deviation_objective_t
      private
      !> Adjoint forcing terms fields
@@ -76,10 +76,8 @@ module drag_lift_deviation_objective
      type(vector_t) :: gamma_vec
      !> weight of the lift deviation penalty term
      real(kind=rp) :: lift_penalty_weight
-     !> target lift coefficient
-     real(kind=rp) :: CL_target
-     !> Force non-dimensionalizaton factor
-     real(kind=rp) :: force_nondim_factor
+     !> target lift
+     real(kind=rp) :: L_target
      !> Coefficients for the SEM.
      type(coef_t), pointer :: coef => null()
 
@@ -116,11 +114,13 @@ contains
     type(simulation_t), target, intent(inout) :: simulation
 
     character(len=:), allocatable :: name
-    real(kind=rp) :: weight
+    real(kind=rp) :: weight, lift_penalty_weight, L_target
 
     call nekotop_continuation%json_get_or_register(json, 'weight', this%weight, weight, 1.0_rp)
     call json_get_or_default(json, "name", name, "Drag with lift deviation")
-    call this%init_from_attributes(design, simulation, weight, name)
+    call json_get(json, "lift_penalty_weight", lift_penalty_weight)
+    call json_get(json, "L_target", L_target)
+    call this%init_from_attributes(design, simulation, weight, name, lift_penalty_weight, L_target)
 
   end subroutine drag_lift_deviation_init_json_sim
 
@@ -130,13 +130,17 @@ contains
   !! @param simulation the simulation.
   !! @param weight the weight of the objective function.
   !! @param name the name of the objective.
+  !! @param lift_penalty_weight weight of the lift deviation penalty term.
+  !! @param L_target target lift.
   subroutine drag_lift_deviation_init_attributes(this, design, simulation, &
-       weight, name)
+       weight, name, lift_penalty_weight, L_target)
     class(drag_lift_deviation_objective_t), intent(inout) :: this
     class(design_t), target, intent(in) :: design
     type(simulation_t), target, intent(inout) :: simulation
     real(kind=rp), intent(in) :: weight
     character(len=*), intent(in) :: name
+    real(kind=rp), intent(in) :: lift_penalty_weight
+    real(kind=rp), intent(in) :: L_target
 
     integer :: alm_id
     type(global_interpolation_t), pointer :: interpolator
@@ -144,6 +148,8 @@ contains
 
     ! Call the base initializer
     call this%init_base(name, design%size(), weight)
+    this%lift_penalty_weight = lift_penalty_weight
+    this%L_target = L_target
 
     ! Get the circulation distribution
     call this%gamma_vec%init(design%size())
@@ -154,9 +160,6 @@ contains
     select type (design)
     type is (actuator_line_design_t)
        call design%get_values(this%gamma_vec)
-       this%lift_penalty_weight = design%lift_penalty_weight
-       this%CL_target = design%CL_target
-       this%force_nondim_factor = design%force_nondim_factor
        interpolator => design%interpolator
        alm_id = design%alm_id
 
@@ -172,7 +175,7 @@ contains
     call this%fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
 
     call drag_lift_deviation%init_from_components(this%fields_adjoint, simulation%adjoint_fluid%c_Xh, interpolator, &
-         this%gamma_vec%x, this%lift_penalty_weight, this%CL_target, this%force_nondim_factor, alm_id)
+         this%gamma_vec%x, this%lift_penalty_weight, this%L_target, alm_id)
 
     ! append adjoint forcing term based on objective function
     select type (f => simulation%adjoint_fluid)
@@ -198,7 +201,7 @@ contains
     class(design_t), intent(in) :: design
 
     integer :: alm_id
-    real(kind=rp) :: lift, drag, CL, CD 
+    real(kind=rp) :: lift, drag
 
     ! Get lift and drag coefficients
     select type (design)
@@ -211,13 +214,11 @@ contains
             'actuator_line_design')
     end select
 
-    ! Objective: J = CD + (\beta / 2) (CL - CL_target)^2
-    CD = drag / this%force_nondim_factor
-    CL = lift / this%force_nondim_factor
-    this%value = CD + 0.5_rp * this%lift_penalty_weight * (CL - this%CL_target)**2
+    ! Objective: J = D_ind + (\beta / 2) (L - L_target)^2
+    this%value = drag + 0.5_rp * this%lift_penalty_weight * (lift - this%L_target)**2
 
-    print *, "CD", CD
-    print *, "CL", CL
+    print *, "Drag", drag
+    print *, "Lift", lift
     print *, "Objective value", this%value
     print *, "Objective weight", this%weight
 
@@ -239,7 +240,7 @@ contains
     real(kind=rp), allocatable :: velinterp_conv_x(:), velinterp_conv_y(:), velinterp_conv_z(:)
     real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
     real(kind=rp), allocatable :: grad(:, :)
-    real(kind=rp) :: delta_CL, lift, drag
+    real(kind=rp) :: delta_L, lift, drag
     integer :: j, n_alm, n_dof, alm_id, temp_index
     character(len=64) :: kernel_name
 
@@ -275,7 +276,7 @@ contains
     n_dof = size(kernel%x, 1)
 
     ! Compute lift deviation
-    delta_CL = (lift / this%force_nondim_factor) - this%CL_target
+    delta_L = lift - this%L_target
 
     call vcross(velinterp_ex_x, velinterp_ex_y, velinterp_ex_z, &
       u_interp%x, v_interp%x, w_interp%x, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of interpolated velocities and x direction
@@ -307,13 +308,15 @@ contains
       u_interp%x, v_interp%x, w_interp%x, conv_x, conv_y, conv_z, n_alm) 
 
     ! Compute gradient with respect to gamma_vec
-    grad(:, 1) = velinterp_conv_x - (velinterp_ex_x - this%lift_penalty_weight*delta_CL*velinterp_ez_x)/this%force_nondim_factor
-    grad(:, 2) = velinterp_conv_y - (velinterp_ex_y - this%lift_penalty_weight*delta_CL*velinterp_ez_y)/this%force_nondim_factor
-    grad(:, 3) = velinterp_conv_z - (velinterp_ex_z - this%lift_penalty_weight*delta_CL*velinterp_ez_z)/this%force_nondim_factor
+    grad(:, 1) = velinterp_conv_x - velinterp_ex_x - this%lift_penalty_weight*delta_L*velinterp_ez_x
+    grad(:, 2) = velinterp_conv_y - velinterp_ex_y - this%lift_penalty_weight*delta_L*velinterp_ez_y
+    grad(:, 3) = velinterp_conv_z - velinterp_ex_z - this%lift_penalty_weight*delta_L*velinterp_ez_z
 
     if (pe_rank .eq. 0) then
-      print *, "delta_CL: ", delta_CL
-      print *, "u_dagger * eta: ", velinterp_conv_y
+      print *, "u_int * ex:", velinterp_ex_y
+      print *, "u_dagger * eta x: ", conv_x
+      print *, "u_dagger * eta z: ", conv_z
+      print *, "u_int x (u_dagger * eta): ", velinterp_conv_y
       print *, "gradient: ", grad(:, 2)
     end if
 

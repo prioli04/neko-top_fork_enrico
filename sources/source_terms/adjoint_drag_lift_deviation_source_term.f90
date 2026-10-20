@@ -64,10 +64,8 @@ module adjoint_drag_lift_deviation_source_term
      type(global_interpolation_t), pointer :: interp => null()
      !> The penalty factor for the lift deviation.
      real(kind=rp) :: beta
-     !> The target lift coefficient.
-     real(kind=rp) :: CL_target
-     !> Force non-dimensionalizaton factor
-     real(kind=rp) :: force_nondim_factor
+     !> The target lift.
+     real(kind=rp) :: L_target
      !> Actuator line instance id
      integer :: alm_id
 
@@ -117,19 +115,17 @@ contains
   !! @param coef The SEM coeffs.
   !! @param gamma_vec The design circulation vector.
   !! @param beta Lift deviation penalty factor.
-  !! @param CL_target Target lift coefficient.
-  !! @param force_nondim_factor Non-dimensionalization factor.
+  !! @param L_target Target lift coefficient.
   !! @param alm_id Actuator line id.
   subroutine adjoint_drag_lift_deviation_source_term_init_from_components(this, fields, coef, interp, gamma_vec,&
-    beta, CL_target, force_nondim_factor, alm_id)
+    beta, L_target, alm_id)
     class(adjoint_drag_lift_deviation_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
     type(global_interpolation_t), pointer, intent(in) :: interp
     real(kind=rp), allocatable, intent(in) :: gamma_vec(:)
     real(kind=rp), intent(in) :: beta
-    real(kind=rp), intent(in) :: CL_target
-    real(kind=rp), intent(in) :: force_nondim_factor
+    real(kind=rp), intent(in) :: L_target
     integer, intent(in) :: alm_id
 
     real(kind=rp) :: start_time, end_time
@@ -144,8 +140,7 @@ contains
     this%interp => interp
     this%gamma_vec = gamma_vec
     this%beta = beta
-    this%CL_target = CL_target
-    this%force_nondim_factor = force_nondim_factor
+    this%L_target = L_target
     this%alm_id = alm_id
 
   end subroutine adjoint_drag_lift_deviation_source_term_init_from_components
@@ -176,7 +171,7 @@ contains
     real(kind=rp), allocatable :: gamma_ez_x(:), gamma_ez_y(:), gamma_ez_z(:)
     real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
     real(kind=rp), allocatable :: f_dagger(:, :)
-    real(kind=rp) :: delta_CL
+    real(kind=rp) :: delta_L
 
     n_alm = size(this%gamma_vec)
 
@@ -192,16 +187,16 @@ contains
     ! Compute lift deviation
     resultant_force_name = make_registry_name("resultant_force", this%alm_id)
     resultant_force => neko_registry%get_vector(resultant_force_name)
-    delta_CL = resultant_force%x(1) / this%force_nondim_factor - this%CL_target
+    delta_L = resultant_force%x(1) - this%L_target
 
     ! Update source terms
     call vcross(gamma_ex_x, gamma_ex_y, gamma_ex_z, zero_vec, this%gamma_vec, zero_vec, one_vec, zero_vec, zero_vec, n_alm) ! Cross product of gamma and x direction
     call vcross(gamma_ez_x, gamma_ez_y, gamma_ez_z, zero_vec, this%gamma_vec, zero_vec, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of gamma and z direction
 
     ! Compute adjoint point forcing
-    f_dagger(:, 1) = - (gamma_ex_x + this%beta * delta_CL * gamma_ez_x) / this%force_nondim_factor
-    f_dagger(:, 2) = - (gamma_ex_y + this%beta * delta_CL * gamma_ez_y) / this%force_nondim_factor
-    f_dagger(:, 3) = - (gamma_ex_z + this%beta * delta_CL * gamma_ez_z) / this%force_nondim_factor
+    f_dagger(:, 1) = - (gamma_ex_x + this%beta * delta_L * gamma_ez_x)
+    f_dagger(:, 2) = - (gamma_ex_y + this%beta * delta_L * gamma_ez_y)
+    f_dagger(:, 3) = - (gamma_ex_z + this%beta * delta_L * gamma_ez_z)
 
     ! Perform the interpolation adjoint (scattering operation) only if the calling rank has points to interpolate
     call this%adjoint_interpolation_compute(f_dagger, n_alm)

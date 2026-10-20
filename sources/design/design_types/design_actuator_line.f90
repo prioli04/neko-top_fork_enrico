@@ -75,12 +75,6 @@ module actuator_line_design
      type(field_t), pointer :: v_adj => null()
      !> w of the adjoint
      type(field_t), pointer :: w_adj => null()
-     !> Weight of the lift deviation penalty term
-     real(kind=rp), public :: lift_penalty_weight
-     !> Target lift coefficient
-     real(kind=rp), public :: CL_target
-     !> Force non-dimensionalizaton factor
-     real(kind=rp), public :: force_nondim_factor
      !> Actuator line instance id
      integer, public :: alm_id
 
@@ -127,16 +121,12 @@ contains
     character(len=:), allocatable :: name
 
     integer :: N
-    real(kind=rp) :: lift_penalty_weight, CL_target, V_inf, b, AR, eps, x_center, y_center, z_center
+    real(kind=rp) :: b, eps, x_center, y_center, z_center
     real(kind=rp), allocatable :: gamma_vec(:)
 
     call json_get_or_default(parameters, 'name', name, 'Actuator Line Design')
     call json_get(parameters, "N", N)
-    call json_get(parameters, "lift_penalty_weight", lift_penalty_weight)
-    call json_get(parameters, "CL_target", CL_target)
-    call json_get(parameters, "V_inf", V_inf)
     call json_get(parameters, 'b', b)
-    call json_get(parameters, 'AR', AR)
     call json_get(parameters, 'eps', eps)
     call json_get(parameters, 'xcenter', x_center)
     call json_get(parameters, 'ycenter', y_center)
@@ -144,8 +134,7 @@ contains
     call json_get(parameters, 'gamma', gamma_vec)
 
     ! Initialize and inject into the simulation
-    call this%init_from_components(name, simulation, N, b, AR, V_inf, eps, x_center, y_center, z_center, &
-         lift_penalty_weight, CL_target, gamma_vec)
+    call this%init_from_components(name, simulation, N, b, eps, x_center, y_center, z_center, gamma_vec)
 
   end subroutine actuator_line_design_init_from_json_sim
 
@@ -166,24 +155,19 @@ contains
 
   end subroutine actuator_line_design_free
 
-  subroutine actuator_line_design_init_from_components(this, name, simulation, N, b, AR, V_inf,&
-      eps, x_center, y_center, z_center, lift_penalty_weight, CL_target, gamma_vec)
+  subroutine actuator_line_design_init_from_components(this, name, simulation, N, b,&
+      eps, x_center, y_center, z_center, gamma_vec)
     class(actuator_line_design_t), target, intent(inout) :: this
     character(len=*), intent(in) :: name
     type(simulation_t), intent(inout) :: simulation
     integer, intent(in) :: N
     real(kind=rp), intent(in) :: b
-    real(kind=rp), intent(in) :: AR
-    real(kind=rp), intent(in) :: V_inf
     real(kind=rp), intent(in) :: eps
     real(kind=rp), intent(in) :: x_center
     real(kind=rp), intent(in) :: y_center
     real(kind=rp), intent(in) :: z_center
-    real(kind=rp), intent(in) :: lift_penalty_weight
-    real(kind=rp), intent(in) :: CL_target
     real(kind=rp), intent(in) :: gamma_vec(:)
 
-    real(kind=rp) :: S
     type(actuator_line_source_term_t) :: forward_source
     type(adjoint_actuator_line_source_term_t) :: adjoint_source
 
@@ -191,15 +175,7 @@ contains
     this%u_adj => simulation%adjoint_fluid%u_adj
     this%v_adj => simulation%adjoint_fluid%v_adj
     this%w_adj => simulation%adjoint_fluid%w_adj
-
-    this%lift_penalty_weight = lift_penalty_weight
-    this%CL_target = CL_target
     this%gamma_vec = gamma_vec
-
-    ! Force non-dimensionalization factor CL = L / (0.5 * rho * V^2 * S)
-    ! For now, rho assumed to be 1
-    S = b**2 / AR
-    this%force_nondim_factor = 0.5_rp * V_inf**2 * S
 
     ! Init list of source fields used for initializing Neko's sources
     call this%fields_forward%init(3)
@@ -212,7 +188,7 @@ contains
 
     ! Init the actuator line term for the forward problem
     call forward_source%init_from_components(this%fields_forward, simulation%fluid%c_Xh, N, &
-      b, this%force_nondim_factor, eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id)
+      b, eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id)
 
     ! Append source term to the forward problem
     call simulation%fluid%source_term%add(forward_source)
