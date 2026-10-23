@@ -50,7 +50,7 @@ module adjoint_drag_lift_deviation_source_term
   use vector, only : vector_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use device_math, only : device_rzero, device_glsc3
-  use math, only : rzero, vcross, glsc3
+  use math, only : rzero, vcross, glsc3, invcol2, glsc2, add2s2
   use comm, only: pe_rank
   implicit none
   private
@@ -60,6 +60,10 @@ module adjoint_drag_lift_deviation_source_term
 
      !> The circulation distribution.
      real(kind=rp), allocatable :: gamma_vec(:)
+     !> Actuator line elements' length
+     type(vector_t), pointer :: dy => null()
+     !> Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x))
+     type(matrix_t), pointer :: kernel_line => null()
      !> Pointer to the interpolator object
      type(global_interpolation_t), pointer :: interp => null()
      !> The penalty factor for the lift deviation.
@@ -83,6 +87,7 @@ module adjoint_drag_lift_deviation_source_term
           adjoint_drag_lift_deviation_source_term_compute
      !> Computes the adjoint of the interpolation operator
      procedure, private, pass(this) :: adjoint_interpolation_compute
+     procedure, private, pass(this) :: adjoint_interpolation_compute2
 
   end type adjoint_drag_lift_deviation_source_term_t
 
@@ -113,16 +118,20 @@ contains
   !! @param this The source term.
   !! @param fields A list of fields for adding the source values.
   !! @param coef The SEM coeffs.
+  !! @param dy Actuator line elements' length.
   !! @param gamma_vec The design circulation vector.
+  !! @param kernel_line Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x)).
   !! @param beta Lift deviation penalty factor.
   !! @param L_target Target lift coefficient.
   !! @param alm_id Actuator line id.
-  subroutine adjoint_drag_lift_deviation_source_term_init_from_components(this, fields, coef, interp, gamma_vec,&
-    beta, L_target, alm_id)
+  subroutine adjoint_drag_lift_deviation_source_term_init_from_components(this, fields, coef, interp, dy, gamma_vec,&
+    kernel_line, beta, L_target, alm_id)
     class(adjoint_drag_lift_deviation_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
     type(global_interpolation_t), pointer, intent(in) :: interp
+    type(vector_t), pointer, intent(in) :: dy
+    type(matrix_t), pointer, intent(in) :: kernel_line
     real(kind=rp), allocatable, intent(in) :: gamma_vec(:)
     real(kind=rp), intent(in) :: beta
     real(kind=rp), intent(in) :: L_target
@@ -137,7 +146,9 @@ contains
     call this%init_base(fields, coef, start_time, end_time)
 
     ! Point everything in the correct places
+    this%kernel_line => kernel_line
     this%interp => interp
+    this%dy => dy
     this%gamma_vec = gamma_vec
     this%beta = beta
     this%L_target = L_target
@@ -151,6 +162,8 @@ contains
     if (allocated(this%gamma_vec)) then
       deallocate(this%gamma_vec)
     end if
+    nullify(this%dy)
+    nullify(this%kernel_line)
     nullify(this%interp)
     call this%free_base()
 
@@ -194,20 +207,56 @@ contains
     call vcross(gamma_ez_x, gamma_ez_y, gamma_ez_z, zero_vec, this%gamma_vec, zero_vec, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of gamma and z direction
 
     ! Compute adjoint point forcing
-    f_dagger(:, 1) = - (gamma_ex_x + this%beta * delta_L * gamma_ez_x)
-    f_dagger(:, 2) = - (gamma_ex_y + this%beta * delta_L * gamma_ez_y)
-    f_dagger(:, 3) = - (gamma_ex_z + this%beta * delta_L * gamma_ez_z)
+    f_dagger(:, 1) = - (gamma_ex_x + this%beta * delta_L * gamma_ez_x) * this%dy%x
+    f_dagger(:, 2) = - (gamma_ex_y + this%beta * delta_L * gamma_ez_y) * this%dy%x
+    f_dagger(:, 3) = - (gamma_ex_z + this%beta * delta_L * gamma_ez_z) * this%dy%x
 
     ! Perform the interpolation adjoint (scattering operation) only if the calling rank has points to interpolate
     call this%adjoint_interpolation_compute(f_dagger, n_alm)
 
     if (pe_rank .eq. 0) then
-      print *, "obj f_adj_x: ", f_dagger(:, 1)
-      print *, "obj f_adj_y: ", f_dagger(:, 2)
-      print *, "obj f_adj_z: ", f_dagger(:, 3)
+      ! print *, "obj f_adj_z: ", f_dagger(:, 3)
     end if
 
   end subroutine adjoint_drag_lift_deviation_source_term_compute
+
+  !> Computes the adjoint of the interpolation operator.
+  !! @param this The object.
+  !! @param f_dagger The actuator line localized adjoint forcing
+  !! @param n_alm Number of actuator line segments
+  subroutine adjoint_interpolation_compute2(this, f_dagger, n_alm)
+    class(adjoint_drag_lift_deviation_source_term_t), intent(inout) :: this
+    integer, intent(in) :: n_alm
+    real(kind=rp), intent(in) :: f_dagger(n_alm, 3)
+    
+    type(field_t), pointer :: fu, fv, fw
+    integer :: j, n_dof
+
+    n_dof = this%coef%dof%size()
+
+    ! Get adjoint RHS fields
+    fu => this%fields%get_by_index(1)
+    fv => this%fields%get_by_index(2)
+    fw => this%fields%get_by_index(3)
+
+    do j = 1, n_alm
+      call add2s2(fu%x, this%kernel_line%x(:,j), -f_dagger(j,1), n_dof)
+      call add2s2(fv%x, this%kernel_line%x(:,j), -f_dagger(j,2), n_dof)
+      call add2s2(fw%x, this%kernel_line%x(:,j), -f_dagger(j,3), n_dof)
+    end do
+
+    ! call invcol2(fu%x, this%coef%B, n_dof)
+    ! call invcol2(fv%x, this%coef%B, n_dof)
+    ! call invcol2(fw%x, this%coef%B, n_dof)
+
+    ! Copy forcing to the device
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call device_memcpy(fu%x, fu%x_d, n_dof, HOST_TO_DEVICE, .true.)
+      call device_memcpy(fv%x, fv%x_d, n_dof, HOST_TO_DEVICE, .true.)
+      call device_memcpy(fw%x, fw%x_d, n_dof, HOST_TO_DEVICE, .true.)
+    end if
+
+  end subroutine adjoint_interpolation_compute2
 
   !> Computes the adjoint of the interpolation operator.
   !! @param this The object.
@@ -259,13 +308,17 @@ contains
                       this%interp%local_interp%weights_s(j, p) * &
                       this%interp%local_interp%weights_t(k, p)
 
-              fu%x(i, j, k, e) = fu%x(i, j, k, e) + weight * f_dagger_local(p, 1)
-              fv%x(i, j, k, e) = fv%x(i, j, k, e) + weight * f_dagger_local(p, 2)
-              fw%x(i, j, k, e) = fw%x(i, j, k, e) + weight * f_dagger_local(p, 3)
+              fu%x(i, j, k, e) = fu%x(i, j, k, e) - weight * f_dagger_local(p, 1)
+              fv%x(i, j, k, e) = fv%x(i, j, k, e) - weight * f_dagger_local(p, 2)
+              fw%x(i, j, k, e) = fw%x(i, j, k, e) - weight * f_dagger_local(p, 3)
             end do
           end do
         end do
       end do
+
+      call invcol2(fu%x, this%coef%B, n_dof)
+      call invcol2(fv%x, this%coef%B, n_dof)
+      call invcol2(fw%x, this%coef%B, n_dof)
 
       ! Copy forcing to the device
       if (NEKO_BCKND_DEVICE .eq. 1) then

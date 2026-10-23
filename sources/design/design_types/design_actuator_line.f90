@@ -75,6 +75,8 @@ module actuator_line_design
      type(field_t), pointer :: v_adj => null()
      !> w of the adjoint
      type(field_t), pointer :: w_adj => null()
+     !> Gaussian kernel core size
+     real(kind=rp), public :: eps
      !> Actuator line instance id
      integer, public :: alm_id
 
@@ -95,6 +97,10 @@ module actuator_line_design
      procedure, pass(this) :: get_resultant_force => actuator_line_design_get_resultant_force
      !> Retrieve the design variables
      procedure, pass(this) :: get_values => actuator_line_design_get_design
+     !> Retrieve the actuator line elements' length
+     procedure, pass(this) :: get_dy => actuator_line_design_get_dy
+     !> Retrieve the actuator line kernels
+     procedure, pass(this) :: get_kernels => actuator_line_design_get_kernels
      !> Retrieve adjoint velocity field
      procedure, pass(this) :: get_adjoint_velocities => actuator_line_design_get_adjoint_velocities
      !> Retrieve interpolated velocities
@@ -170,12 +176,16 @@ contains
 
     type(actuator_line_source_term_t) :: forward_source
     type(adjoint_actuator_line_source_term_t) :: adjoint_source
+    type(matrix_t), pointer :: kernel_line => null()
+    type(matrix_t), pointer :: kernel_volume => null()
+    type(vector_t), pointer :: dy => null()
 
     call this%init_base(name, N)
     this%u_adj => simulation%adjoint_fluid%u_adj
     this%v_adj => simulation%adjoint_fluid%v_adj
     this%w_adj => simulation%adjoint_fluid%w_adj
     this%gamma_vec = gamma_vec
+    this%eps = eps
 
     ! Init list of source fields used for initializing Neko's sources
     call this%fields_forward%init(3)
@@ -188,10 +198,14 @@ contains
 
     ! Init the actuator line term for the forward problem
     call forward_source%init_from_components(this%fields_forward, simulation%fluid%c_Xh, N, &
-      b, eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id)
+      b, this%eps, x_center, y_center, z_center, gamma_vec, this%interpolator, this%alm_id)
 
     ! Append source term to the forward problem
     call simulation%fluid%source_term%add(forward_source)
+
+    ! Retrieve variables created in the forward source term via Neko's registry
+    call this%get_dy(dy)
+    call this%get_kernels(ptr_volume=kernel_volume, ptr_line=kernel_line)
 
     ! Init list of source fields used for initializing the adjoint source
     call this%fields_adjoint%init(3)
@@ -202,7 +216,7 @@ contains
     ! Init the actuator line source term for the adjoint
     call adjoint_source%init_from_components(this%fields_adjoint, simulation%adjoint_fluid%c_Xh, this%interpolator, &
          simulation%adjoint_fluid%u_adj, simulation%adjoint_fluid%v_adj, simulation%adjoint_fluid%w_adj, &
-         this%gamma_vec, this%alm_id)
+         dy, kernel_line, kernel_volume, this%gamma_vec, this%eps)
          
     ! Append source term to the adjoint problem
     select type (f => simulation%adjoint_fluid)
@@ -229,6 +243,37 @@ contains
     values%x = this%gamma_vec
 
   end subroutine actuator_line_design_get_design
+
+  subroutine actuator_line_design_get_dy(this, dy)
+    class(actuator_line_design_t), intent(in) :: this
+    type(vector_t), pointer, intent(out) :: dy
+
+    integer :: i, n_alm
+    character(len=64) :: dy_name
+
+    dy_name = make_registry_name("dy", this%alm_id)
+    dy => neko_registry%get_vector(trim(dy_name))
+
+  end subroutine actuator_line_design_get_dy
+
+  subroutine actuator_line_design_get_kernels(this, ptr_volume, ptr_line)
+    class(actuator_line_design_t), intent(in) :: this
+    type(matrix_t), pointer, intent(out), optional :: ptr_volume
+    type(matrix_t), pointer, intent(out), optional :: ptr_line
+
+    character(len=64) :: kernel_volume_name, kernel_line_name
+
+    if (present(ptr_volume)) then
+      kernel_volume_name = make_registry_name("kernel_volume", this%alm_id)
+      ptr_volume => neko_registry%get_matrix(trim(kernel_volume_name))
+    end if
+
+    if (present(ptr_line)) then
+      kernel_line_name = make_registry_name("kernel_line", this%alm_id)
+      ptr_line => neko_registry%get_matrix(trim(kernel_line_name))
+    end if
+
+  end subroutine actuator_line_design_get_kernels
 
   subroutine actuator_line_design_get_adjoint_velocities(this, u_adj, v_adj, w_adj)
     class(actuator_line_design_t), intent(in) :: this

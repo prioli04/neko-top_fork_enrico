@@ -43,13 +43,12 @@ module adjoint_actuator_line_source_term
   use json_module, only : json_file
   use time_state, only: time_state_t
   use source_term, only : source_term_t
-  use actuator_line_source_term, only: make_registry_name
   use coefs, only : coef_t
   use global_interpolation, only : global_interpolation_t
+  use vector, only: vector_t
   use matrix, only : matrix_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
-  use device_math, only : device_rzero, device_glsc3
-  use math, only : rzero, vcross, glsc3
+  use math, only : vcross, glsc3, pi, glsc2, invcol2, glmax, add2s2
   use comm, only: pe_rank
   implicit none
   private
@@ -59,6 +58,14 @@ module adjoint_actuator_line_source_term
 
      !> The circulation distribution.
      real(kind=rp), allocatable :: gamma_vec(:)
+     !> Gaussian kernel core size
+     real(kind=rp) :: eps
+     !> Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x))
+     type(matrix_t), pointer :: kernel_line => null()
+     !> Gaussian kernel for the volume convolution (Gaussian evaluated at a point)
+     type(matrix_t), pointer :: kernel_volume => null()
+     !> Actuator line elements' length
+     type(vector_t), pointer :: dy => null()
      !> u of the adjoint
      type(field_t), pointer :: u_adj => null()
      !> v of the adjoint
@@ -67,8 +74,6 @@ module adjoint_actuator_line_source_term
      type(field_t), pointer :: w_adj => null()
      !> Pointer to the interpolator object
      type(global_interpolation_t), pointer :: interp => null()
-     !> Actuator line instance id
-     integer :: alm_id
 
    contains
      !> The common constructor using a JSON object.
@@ -84,6 +89,7 @@ module adjoint_actuator_line_source_term
           adjoint_actuator_line_source_term_compute
      !> Computes the adjoint of the interpolation operator
      procedure, private, pass(this) :: adjoint_interpolation_compute
+     procedure, private, pass(this) :: adjoint_interpolation_compute2
 
   end type adjoint_actuator_line_source_term_t
 
@@ -117,17 +123,23 @@ contains
   !! @param u_adj X component of the adjoint velocity field.
   !! @param v_adj Y component of the adjoint velocity field.
   !! @param w_adj Z component of the adjoint velocity field.
+  !! @param dy Actuator line elements' length.
+  !! @param kernel_line Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x)).
+  !! @param kernel_volume Gaussian kernel for the volume convolution (Gaussian evaluated at a point).
   !! @param gamma_vec The design circulation vector.
-  !! @param alm_id Actuator line id.
-  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, interp, u_adj, v_adj, w_adj, gamma_vec,&
-    alm_id)
+  !! @param eps Gaussian kernel core size.
+  subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, interp, u_adj, v_adj, w_adj,&
+    dy, kernel_line, kernel_volume, gamma_vec, eps)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
     type(global_interpolation_t), target, intent(in) :: interp
     type(field_t), intent(in), target :: u_adj, v_adj, w_adj
+    type(vector_t), pointer, intent(in) :: dy
+    type(matrix_t), pointer, intent(in) :: kernel_line
+    type(matrix_t), pointer, intent(in) :: kernel_volume
     real(kind=rp), allocatable, intent(in) :: gamma_vec(:)
-    integer, intent(in) :: alm_id
+    real(kind=rp), intent(in) :: eps
 
     real(kind=rp) :: start_time, end_time
 
@@ -142,8 +154,11 @@ contains
     this%v_adj => v_adj
     this%w_adj => w_adj
     this%interp => interp
+    this%dy => dy
+    this%kernel_line => kernel_line
+    this%kernel_volume => kernel_volume
     this%gamma_vec = gamma_vec
-    this%alm_id = alm_id
+    this%eps = eps
 
   end subroutine adjoint_actuator_line_source_term_init_from_components
 
@@ -153,6 +168,9 @@ contains
     if (allocated(this%gamma_vec)) then
       deallocate(this%gamma_vec)
     end if
+    nullify(this%dy)
+    nullify(this%kernel_line)
+    nullify(this%kernel_volume)
     nullify(this%u_adj)
     nullify(this%v_adj)
     nullify(this%w_adj)
@@ -168,17 +186,14 @@ contains
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(time_state_t), intent(in) :: time
     
-    integer :: n_alm, n_dof, j, temp_index
-    type(field_t), pointer :: temp_kernel
-    type(matrix_t), pointer :: kernel
-    character(len=64) :: kernel_name
-
+    integer :: n_alm, n_dof, j
+    real(kind=rp) :: max_udagger_z
     real(kind=rp), allocatable :: conv_x(:), conv_y(:), conv_z(:)
     real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
     real(kind=rp), allocatable :: f_dagger(:, :)
 
     n_alm = size(this%gamma_vec)
-    n_dof = this%fields%item_size(1)
+    n_dof = this%coef%dof%size()
 
     ! Allocate arrays
     allocate(conv_x(n_alm), conv_y(n_alm), conv_z(n_alm))
@@ -188,43 +203,71 @@ contains
     zero_vec = 0.0_rp
     one_vec = 1.0_rp
 
-    ! Get kernel values
-    kernel_name = make_registry_name("kernel", this%alm_id)
-    kernel => neko_registry%get_matrix(kernel_name)
-
-    ! Volumetric convolution of the adjoint velocity with the gaussian kernel
-    if (NEKO_BCKND_DEVICE .eq. 1) then
-      call neko_scratch_registry%request_field(temp_kernel, temp_index, .false.)
-
-      do j = 1, n_alm
-        call device_memcpy(kernel%x(:,j), temp_kernel%x_d, n_dof, HOST_TO_DEVICE, sync=.true.)
-        conv_x(j) = device_glsc3(this%u_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
-        conv_y(j) = device_glsc3(this%v_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
-        conv_z(j) = device_glsc3(this%w_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
-      end do
-
-      call neko_scratch_registry%relinquish_field(temp_index)
-    else
-      do j = 1, n_alm
-        conv_x(j) = glsc3(this%u_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
-        conv_y(j) = glsc3(this%v_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
-        conv_z(j) = glsc3(this%w_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
-      end do
-    end if
+    ! Volumetric adjoint convolution of the adjoint velocity with the gaussian kernel
+    do j = 1, n_alm
+      ! Usage of glsc3 needed in order to take into account the nodes in other ranks (MPI Reduce)
+      conv_x(j) = glsc3(this%u_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
+      conv_y(j) = glsc3(this%v_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
+      conv_z(j) = glsc3(this%w_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
+    end do 
 
     ! Compute adjoint point forcing
-    call vcross(f_dagger(:, 1), f_dagger(:, 2), f_dagger(:, 3), zero_vec, this%gamma_vec, zero_vec, conv_x, conv_y, conv_z, n_alm) 
+    call vcross(f_dagger(:, 1), f_dagger(:, 2), f_dagger(:, 3), zero_vec, this%gamma_vec * this%dy%x, zero_vec,&
+    conv_x, conv_y, conv_z, n_alm) 
 
     ! Perform the interpolation adjoint (scattering operation) only if the calling rank has points to interpolate
     call this%adjoint_interpolation_compute(f_dagger, n_alm)
 
+    max_udagger_z = glmax(abs(this%w_adj%x), size(this%w_adj%x))
+    
     if (pe_rank .eq. 0) then
-      print *, "alm f_adj_x: ", f_dagger(:, 1)
-      print *, "alm f_adj_y: ", f_dagger(:, 2)
-      print *, "alm f_adj_z: ", f_dagger(:, 3)
+      print *, "(u_dagger * eta)_z", conv_z
+      print *, "max(u_dagger_z)", max_udagger_z
+
+      ! print *, "alm f_adj_x: ", f_dagger(:, 1)
+      ! print *, "alm f_adj_z: ", f_dagger(:, 3)
     end if
 
+
   end subroutine adjoint_actuator_line_source_term_compute
+
+  !> Computes the adjoint of the interpolation operator.
+  !! @param this The object.
+  !! @param f_dagger The actuator line localized adjoint forcing
+  !! @param n_alm Number of actuator line segments
+  subroutine adjoint_interpolation_compute2(this, f_dagger, n_alm)
+    class(adjoint_actuator_line_source_term_t), intent(inout) :: this
+    integer, intent(in) :: n_alm
+    real(kind=rp), intent(in) :: f_dagger(n_alm, 3)
+    
+    type(field_t), pointer :: fu, fv, fw
+    integer :: j, n_dof
+
+    n_dof = this%coef%dof%size()
+
+    ! Get adjoint RHS fields
+    fu => this%fields%get_by_index(1)
+    fv => this%fields%get_by_index(2)
+    fw => this%fields%get_by_index(3)
+
+    do j = 1, n_alm
+      call add2s2(fu%x, this%kernel_line%x(:,j), -f_dagger(j,1), n_dof)
+      call add2s2(fv%x, this%kernel_line%x(:,j), -f_dagger(j,2), n_dof)
+      call add2s2(fw%x, this%kernel_line%x(:,j), -f_dagger(j,3), n_dof)
+    end do
+
+    ! call invcol2(fu%x, this%coef%B, n_dof)
+    ! call invcol2(fv%x, this%coef%B, n_dof)
+    ! call invcol2(fw%x, this%coef%B, n_dof)
+
+    ! Copy forcing to the device
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call device_memcpy(fu%x, fu%x_d, n_dof, HOST_TO_DEVICE, .true.)
+      call device_memcpy(fv%x, fv%x_d, n_dof, HOST_TO_DEVICE, .true.)
+      call device_memcpy(fw%x, fw%x_d, n_dof, HOST_TO_DEVICE, .true.)
+    end if
+
+  end subroutine adjoint_interpolation_compute2
 
   !> Computes the adjoint of the interpolation operator.
   !! @param this The object.
@@ -283,13 +326,17 @@ contains
               !   this%coef%dof%y(i,j,k,e), &
               !   this%coef%dof%z(i,j,k,e)
 
-              fu%x(i, j, k, e) = fu%x(i, j, k, e) + weight * f_dagger_local(p, 1)
-              fv%x(i, j, k, e) = fv%x(i, j, k, e) + weight * f_dagger_local(p, 2)
-              fw%x(i, j, k, e) = fw%x(i, j, k, e) + weight * f_dagger_local(p, 3)
+              fu%x(i, j, k, e) = fu%x(i, j, k, e) - weight * f_dagger_local(p, 1)
+              fv%x(i, j, k, e) = fv%x(i, j, k, e) - weight * f_dagger_local(p, 2)
+              fw%x(i, j, k, e) = fw%x(i, j, k, e) - weight * f_dagger_local(p, 3)
             end do
           end do
         end do
       end do
+
+      call invcol2(fu%x, this%coef%B, n_dof)
+      call invcol2(fv%x, this%coef%B, n_dof)
+      call invcol2(fw%x, this%coef%B, n_dof)
 
       ! Copy forcing to the device
       if (NEKO_BCKND_DEVICE .eq. 1) then

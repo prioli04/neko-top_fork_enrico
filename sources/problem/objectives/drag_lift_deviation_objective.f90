@@ -46,7 +46,6 @@ module drag_lift_deviation_objective
   use design, only: design_t
   use actuator_line_design, only: actuator_line_design_t
   use simulation_m, only: simulation_t
-  use actuator_line_source_term, only: make_registry_name
   use adjoint_drag_lift_deviation_source_term, only: adjoint_drag_lift_deviation_source_term_t
   use num_types, only: rp
   use field, only: field_t
@@ -58,7 +57,7 @@ module drag_lift_deviation_objective
   use registry, only: neko_registry
   use registry, only: neko_registry
   use coefs, only: coef_t
-  use math, only: vcross, glsc3, copy
+  use math, only: vcross, glsc3, copy, pi, glsc2
   use device_math, only: device_copy, device_glsc3
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
   use continuation_scheduler, only: nekotop_continuation
@@ -74,6 +73,14 @@ module drag_lift_deviation_objective
      type(field_list_t) :: fields_adjoint
      !> Circulation distribution.
      type(vector_t) :: gamma_vec
+     !> Actuator line elements' length
+     type(vector_t), pointer :: dy => null()
+     !> Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x))
+     type(matrix_t), pointer :: kernel_line => null()
+     !> Gaussian kernel for the volume convolution (Gaussian evaluated at a point)
+     type(matrix_t), pointer :: kernel_volume => null()
+     !> Gaussian kernel core size
+     real(kind=rp) :: eps
      !> weight of the lift deviation penalty term
      real(kind=rp) :: lift_penalty_weight
      !> target lift
@@ -160,6 +167,9 @@ contains
     select type (design)
     type is (actuator_line_design_t)
        call design%get_values(this%gamma_vec)
+       call design%get_dy(this%dy)
+       call design%get_kernels(ptr_volume=this%kernel_volume, ptr_line=this%kernel_line)
+       this%eps = design%eps
        interpolator => design%interpolator
        alm_id = design%alm_id
 
@@ -175,7 +185,7 @@ contains
     call this%fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
 
     call drag_lift_deviation%init_from_components(this%fields_adjoint, simulation%adjoint_fluid%c_Xh, interpolator, &
-         this%gamma_vec%x, this%lift_penalty_weight, this%L_target, alm_id)
+         this%dy, this%gamma_vec%x, this%kernel_line, this%lift_penalty_weight, this%L_target, alm_id)
 
     ! append adjoint forcing term based on objective function
     select type (f => simulation%adjoint_fluid)
@@ -189,6 +199,10 @@ contains
   subroutine drag_lift_deviation_free(this)
     class(drag_lift_deviation_objective_t), intent(inout) :: this
     call this%gamma_vec%free()
+    nullify(this%dy)
+    nullify(this%kernel_line)
+    nullify(this%kernel_volume)
+    nullify(this%coef)
     call this%free_base()
 
   end subroutine drag_lift_deviation_free
@@ -200,14 +214,12 @@ contains
     class(drag_lift_deviation_objective_t), intent(inout) :: this
     class(design_t), intent(in) :: design
 
-    integer :: alm_id
     real(kind=rp) :: lift, drag
 
     ! Get lift and drag coefficients
     select type (design)
     type is (actuator_line_design_t)
        call design%get_resultant_force(lift, drag)
-       alm_id = design%alm_id
 
     class default
        call neko_error('Drag with lift deviation objective only works with '// &
@@ -231,8 +243,7 @@ contains
     class(drag_lift_deviation_objective_t), intent(inout) :: this
     class(design_t), intent(in) :: design
 
-    type(field_t), pointer :: u_adj, v_adj, w_adj, temp_kernel
-    type(matrix_t), pointer :: kernel
+    type(field_t), pointer :: u_adj, v_adj, w_adj
     type(vector_t), pointer :: u_interp, v_interp, w_interp
     real(kind=rp), allocatable :: velinterp_ex_x(:), velinterp_ex_y(:), velinterp_ex_z(:)
     real(kind=rp), allocatable :: velinterp_ez_x(:), velinterp_ez_y(:), velinterp_ez_z(:)
@@ -241,8 +252,7 @@ contains
     real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
     real(kind=rp), allocatable :: grad(:, :)
     real(kind=rp) :: delta_L, lift, drag
-    integer :: j, n_alm, n_dof, alm_id, temp_index
-    character(len=64) :: kernel_name
+    integer :: j, n_alm, n_dof
 
     ! Get interpolated velocities
     select type (design)
@@ -250,7 +260,6 @@ contains
        call design%get_adjoint_velocities(u_adj, v_adj, w_adj)
        call design%get_interp_velocities(u_interp, v_interp, w_interp)
        call design%get_resultant_force(lift, drag)
-       alm_id = design%alm_id
 
     class default
        call neko_error('Drag with lift deviation objective only works with '// &
@@ -258,6 +267,7 @@ contains
     end select
 
     n_alm = this%gamma_vec%size()
+    n_dof = this%coef%dof%size()
 
     ! Allocate arrays
     allocate(velinterp_ex_x(n_alm), velinterp_ex_y(n_alm), velinterp_ex_z(n_alm))
@@ -270,11 +280,6 @@ contains
     zero_vec = 0.0_rp
     one_vec = 1.0_rp
 
-    ! Get kernel values
-    kernel_name = make_registry_name("kernel", alm_id)
-    kernel => neko_registry%get_matrix(kernel_name)
-    n_dof = size(kernel%x, 1)
-
     ! Compute lift deviation
     delta_L = lift - this%L_target
 
@@ -283,40 +288,27 @@ contains
     call vcross(velinterp_ez_x, velinterp_ez_y, velinterp_ez_z, &
       u_interp%x, v_interp%x, w_interp%x, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of interpolated velocities and z direction
 
-    ! Volumetric convolution of the adjoint velocity with the gaussian kernel
-    if (NEKO_BCKND_DEVICE .eq. 1) then
-      call neko_scratch_registry%request_field(temp_kernel, temp_index, .false.)
-
-      do j = 1, n_alm
-        call device_memcpy(kernel%x(:,j), temp_kernel%x_d, n_dof, HOST_TO_DEVICE, sync=.true.)
-        conv_x(j) = device_glsc3(u_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
-        conv_y(j) = device_glsc3(v_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
-        conv_z(j) = device_glsc3(w_adj%x_d, temp_kernel%x_d, this%coef%B_d, n_dof)
-      end do
-
-      call neko_scratch_registry%relinquish_field(temp_index)
-    else
-      do j = 1, n_alm
-        conv_x(j) = glsc3(u_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
-        conv_y(j) = glsc3(v_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
-        conv_z(j) = glsc3(w_adj%x(:,1,1,1), kernel%x(:,j), this%coef%B, n_dof)
-      end do
-    end if
+    ! Volumetric adjoint convolution of the adjoint velocity with the gaussian kernel
+    do j = 1, n_alm
+      ! Usage of glsc3 needed in order to take into account the nodes in other ranks (MPI Reduce)
+      conv_x(j) = glsc3(u_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
+      conv_y(j) = glsc3(v_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
+      conv_z(j) = glsc3(w_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
+    end do 
 
     ! Cross product of interpolated velocities and volumetric convolution
     call vcross(velinterp_conv_x, velinterp_conv_y, velinterp_conv_z, &
       u_interp%x, v_interp%x, w_interp%x, conv_x, conv_y, conv_z, n_alm) 
 
     ! Compute gradient with respect to gamma_vec
-    grad(:, 1) = velinterp_conv_x - velinterp_ex_x - this%lift_penalty_weight*delta_L*velinterp_ez_x
-    grad(:, 2) = velinterp_conv_y - velinterp_ex_y - this%lift_penalty_weight*delta_L*velinterp_ez_y
-    grad(:, 3) = velinterp_conv_z - velinterp_ex_z - this%lift_penalty_weight*delta_L*velinterp_ez_z
+    grad(:, 1) = (velinterp_conv_x - velinterp_ex_x - this%lift_penalty_weight*delta_L*velinterp_ez_x) * this%dy%x
+    grad(:, 2) = (velinterp_conv_y - velinterp_ex_y - this%lift_penalty_weight*delta_L*velinterp_ez_y) * this%dy%x
+    grad(:, 3) = (velinterp_conv_z - velinterp_ex_z - this%lift_penalty_weight*delta_L*velinterp_ez_z) * this%dy%x
 
     if (pe_rank .eq. 0) then
-      print *, "u_int * ex:", velinterp_ex_y
-      print *, "u_dagger * eta x: ", conv_x
-      print *, "u_dagger * eta z: ", conv_z
-      print *, "u_int x (u_dagger * eta): ", velinterp_conv_y
+      print *, "(u_int * ex) * dy:", velinterp_ex_y * this%dy%x
+      print *, "(u_dagger * eta)_ z: ", conv_z 
+      print *, "(u_int x (u_dagger * eta)_z) * dy: ", velinterp_conv_y * this%dy%x
       print *, "gradient: ", grad(:, 2)
     end if
 
