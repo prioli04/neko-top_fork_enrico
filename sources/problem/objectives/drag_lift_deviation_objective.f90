@@ -71,8 +71,6 @@ module drag_lift_deviation_objective
      private
      !> Adjoint forcing terms fields
      type(field_list_t) :: fields_adjoint
-     !> Circulation distribution.
-     type(vector_t) :: gamma_vec
      !> Actuator line elements' length
      type(vector_t), pointer :: dy => null()
      !> Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x))
@@ -152,21 +150,19 @@ contains
     integer :: alm_id
     type(global_interpolation_t), pointer :: interpolator
     type(adjoint_drag_lift_deviation_source_term_t) :: drag_lift_deviation
+    type(vector_t), pointer :: gamma_ptr
 
     ! Call the base initializer
     call this%init_base(name, design%size(), weight)
     this%lift_penalty_weight = lift_penalty_weight
     this%L_target = L_target
 
-    ! Get the circulation distribution
-    call this%gamma_vec%init(design%size())
-
     ! Get adjoint mass matrix coefficients
     this%coef => simulation%adjoint_case%fluid_adj%c_Xh
 
     select type (design)
     type is (actuator_line_design_t)
-       call design%get_values(this%gamma_vec)
+       call design%get_gamma(gamma_ptr)
        call design%get_dy(this%dy)
        call design%get_kernels(ptr_volume=this%kernel_volume, ptr_line=this%kernel_line)
        this%eps = design%eps
@@ -185,7 +181,7 @@ contains
     call this%fields_adjoint%assign(3, simulation%adjoint_fluid%f_adj_z)
 
     call drag_lift_deviation%init_from_components(this%fields_adjoint, simulation%adjoint_fluid%c_Xh, interpolator, &
-         this%dy, this%gamma_vec%x, this%kernel_line, this%lift_penalty_weight, this%L_target, alm_id)
+         this%dy, gamma_ptr, this%kernel_line, this%lift_penalty_weight, this%L_target, alm_id)
 
     ! append adjoint forcing term based on objective function
     select type (f => simulation%adjoint_fluid)
@@ -198,7 +194,6 @@ contains
   !> Destructor.
   subroutine drag_lift_deviation_free(this)
     class(drag_lift_deviation_objective_t), intent(inout) :: this
-    call this%gamma_vec%free()
     nullify(this%dy)
     nullify(this%kernel_line)
     nullify(this%kernel_volume)
@@ -228,11 +223,6 @@ contains
 
     ! Objective: J = D_ind + (\beta / 2) (L - L_target)^2
     this%value = drag + 0.5_rp * this%lift_penalty_weight * (lift - this%L_target)**2
-
-    print *, "Drag", drag
-    print *, "Lift", lift
-    print *, "Objective value", this%value
-    print *, "Objective weight", this%weight
 
   end subroutine drag_lift_deviation_update_value
 
@@ -266,7 +256,7 @@ contains
             'actuator_line_design')
     end select
 
-    n_alm = this%gamma_vec%size()
+    n_alm = this%dy%size()
     n_dof = this%coef%dof%size()
 
     ! Allocate arrays
@@ -300,15 +290,15 @@ contains
     call vcross(velinterp_conv_x, velinterp_conv_y, velinterp_conv_z, &
       u_interp%x, v_interp%x, w_interp%x, conv_x, conv_y, conv_z, n_alm) 
 
-    ! Compute gradient with respect to gamma_vec
+    ! Compute gradient with respect to gamma
     grad(:, 1) = (velinterp_conv_x - velinterp_ex_x - this%lift_penalty_weight*delta_L*velinterp_ez_x) * this%dy%x
     grad(:, 2) = (velinterp_conv_y - velinterp_ex_y - this%lift_penalty_weight*delta_L*velinterp_ez_y) * this%dy%x
     grad(:, 3) = (velinterp_conv_z - velinterp_ex_z - this%lift_penalty_weight*delta_L*velinterp_ez_z) * this%dy%x
 
     if (pe_rank .eq. 0) then
-      print *, "(u_int * ex) * dy:", velinterp_ex_y * this%dy%x
-      print *, "(u_dagger * eta)_ z: ", conv_z 
+      print *, "-(u_int * ex) * dy:", -velinterp_ex_y * this%dy%x
       print *, "(u_int x (u_dagger * eta)_z) * dy: ", velinterp_conv_y * this%dy%x
+      print *, "-(u_int * ez) * dy: ", -this%lift_penalty_weight * delta_L * velinterp_ez_y * this%dy%x
       print *, "gradient: ", grad(:, 2)
     end if
 

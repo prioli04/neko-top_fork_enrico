@@ -7,8 +7,8 @@
         "output_checkpoints": false,
         "output_at_end": true,
         "time": {
-            "end_time": 10.0,
-            "timestep": 1.5e-2,
+            "end_time": 5.0,
+            "timestep": 1.25e-2,
             "variable_timestep": false,
             "target_cfl": 0.4
         },
@@ -78,41 +78,31 @@
     "optimization": {
         "design": {
             "type": "actuator_line",
-            "N": 10,
-            "lift_penalty_weight": 0.0,
-            "CL_target": 0.5,
-            "V_inf": 1.0,
-            "b": 2.0,
-            "AR": 10.0,
-            "eps": 1.0,
+            "N": 4,
+            "b": 3.0,
+            "eps": 0.375,
             "xcenter": 0.0,
             "ycenter": 0.0,
             "zcenter": 0.0,
-            "gamma": [0.02775, 0.04546, 0.05513, 0.06073, 0.06334, 0.06334, 0.06073, 0.05513, 0.04546, 0.02775]
+            "gamma": [0.1, 0.1, 0.1, 0.1]
         },
         "solver": {
             "type": "mma",
-            "max_iterations": 5,
-            "tolerance": 1.0e-3,
+            "max_iterations": 10,
+            "tolerance": 1.0e-7,
             "mma": {
-                "max_iter": 100,
-                "asyinit": 0.5,
-                "asyincr": 1.2,
-                "asydecr": 0.7,
-                "scale": 1.0,
-                "auto_scale": false,
-                "xmin": 0.0,
-                "xmax": 1.0,
-                "a0": 1.0,
-                "a": 0.0,
-                "c": 1000.0,
-                "d": 10.0
+                "asyinit": 0.1,
+                "asyincr": 1.05,
+                "asydecr": 0.65,
+                "move_limit": 0.1
             }
         },
         "objectives": [
             {
                 "type": "drag_lift_deviation",
-                "weight": 1.0
+                "weight": 1.0,
+                "lift_penalty_weight": 2.0,
+                "L_target": 0.1
             }
         ]
     }

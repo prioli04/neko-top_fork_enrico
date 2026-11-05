@@ -48,7 +48,7 @@ module adjoint_actuator_line_source_term
   use vector, only: vector_t
   use matrix, only : matrix_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
-  use math, only : vcross, glsc3, pi, glsc2, invcol2, glmax, add2s2
+  use math, only : vcross, glsc3, pi, invcol2, glmax, add2s2, col2, add2
   use comm, only: pe_rank
   implicit none
   private
@@ -57,7 +57,7 @@ module adjoint_actuator_line_source_term
   type, public, extends(source_term_t) :: adjoint_actuator_line_source_term_t
 
      !> The circulation distribution.
-     real(kind=rp), allocatable :: gamma_vec(:)
+     type(vector_t), pointer :: gamma_ptr => null()
      !> Gaussian kernel core size
      real(kind=rp) :: eps
      !> Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x))
@@ -126,10 +126,10 @@ contains
   !! @param dy Actuator line elements' length.
   !! @param kernel_line Gaussian kernel for the line convolution (Gaussian integrated on segments of constant f(x)).
   !! @param kernel_volume Gaussian kernel for the volume convolution (Gaussian evaluated at a point).
-  !! @param gamma_vec The design circulation vector.
+  !! @param gamma_ptr The design circulation vector pointer.
   !! @param eps Gaussian kernel core size.
   subroutine adjoint_actuator_line_source_term_init_from_components(this, fields, coef, interp, u_adj, v_adj, w_adj,&
-    dy, kernel_line, kernel_volume, gamma_vec, eps)
+    dy, kernel_line, kernel_volume, gamma_ptr, eps)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     type(field_list_t), intent(in), target :: fields
     type(coef_t), intent(in) :: coef
@@ -138,7 +138,7 @@ contains
     type(vector_t), pointer, intent(in) :: dy
     type(matrix_t), pointer, intent(in) :: kernel_line
     type(matrix_t), pointer, intent(in) :: kernel_volume
-    real(kind=rp), allocatable, intent(in) :: gamma_vec(:)
+    type(vector_t), pointer, intent(in) :: gamma_ptr
     real(kind=rp), intent(in) :: eps
 
     real(kind=rp) :: start_time, end_time
@@ -157,7 +157,7 @@ contains
     this%dy => dy
     this%kernel_line => kernel_line
     this%kernel_volume => kernel_volume
-    this%gamma_vec = gamma_vec
+    this%gamma_ptr => gamma_ptr
     this%eps = eps
 
   end subroutine adjoint_actuator_line_source_term_init_from_components
@@ -165,9 +165,7 @@ contains
   !> Destructor.
   subroutine adjoint_actuator_line_source_term_free(this)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
-    if (allocated(this%gamma_vec)) then
-      deallocate(this%gamma_vec)
-    end if
+    nullify(this%gamma_ptr)
     nullify(this%dy)
     nullify(this%kernel_line)
     nullify(this%kernel_volume)
@@ -192,7 +190,7 @@ contains
     real(kind=rp), allocatable :: zero_vec(:), one_vec(:)
     real(kind=rp), allocatable :: f_dagger(:, :)
 
-    n_alm = size(this%gamma_vec)
+    n_alm = size(this%gamma_ptr%x)
     n_dof = this%coef%dof%size()
 
     ! Allocate arrays
@@ -212,17 +210,17 @@ contains
     end do 
 
     ! Compute adjoint point forcing
-    call vcross(f_dagger(:, 1), f_dagger(:, 2), f_dagger(:, 3), zero_vec, this%gamma_vec * this%dy%x, zero_vec,&
+    call vcross(f_dagger(:, 1), f_dagger(:, 2), f_dagger(:, 3), zero_vec, this%gamma_ptr%x, zero_vec,&
     conv_x, conv_y, conv_z, n_alm) 
 
     ! Perform the interpolation adjoint (scattering operation) only if the calling rank has points to interpolate
     call this%adjoint_interpolation_compute(f_dagger, n_alm)
+    ! call this%adjoint_interpolation_compute2(f_dagger, n_alm)
 
     max_udagger_z = glmax(abs(this%w_adj%x), size(this%w_adj%x))
     
     if (pe_rank .eq. 0) then
-      print *, "(u_dagger * eta)_z", conv_z
-      print *, "max(u_dagger_z)", max_udagger_z
+      print *, "max(u_dagger_z)", maxval(abs(conv_z))
 
       ! print *, "alm f_adj_x: ", f_dagger(:, 1)
       ! print *, "alm f_adj_z: ", f_dagger(:, 3)
@@ -238,7 +236,7 @@ contains
   subroutine adjoint_interpolation_compute2(this, f_dagger, n_alm)
     class(adjoint_actuator_line_source_term_t), intent(inout) :: this
     integer, intent(in) :: n_alm
-    real(kind=rp), intent(in) :: f_dagger(n_alm, 3)
+    real(kind=rp), intent(inout) :: f_dagger(n_alm, 3)
     
     type(field_t), pointer :: fu, fv, fw
     integer :: j, n_dof
@@ -250,15 +248,16 @@ contains
     fv => this%fields%get_by_index(2)
     fw => this%fields%get_by_index(3)
 
+    ! Scale forcing by actuator line weights
+    f_dagger(:, 1) = f_dagger(:, 1) * this%dy%x
+    f_dagger(:, 2) = f_dagger(:, 2) * this%dy%x
+    f_dagger(:, 3) = f_dagger(:, 3) * this%dy%x
+
     do j = 1, n_alm
       call add2s2(fu%x, this%kernel_line%x(:,j), -f_dagger(j,1), n_dof)
       call add2s2(fv%x, this%kernel_line%x(:,j), -f_dagger(j,2), n_dof)
       call add2s2(fw%x, this%kernel_line%x(:,j), -f_dagger(j,3), n_dof)
     end do
-
-    ! call invcol2(fu%x, this%coef%B, n_dof)
-    ! call invcol2(fv%x, this%coef%B, n_dof)
-    ! call invcol2(fw%x, this%coef%B, n_dof)
 
     ! Copy forcing to the device
     if (NEKO_BCKND_DEVICE .eq. 1) then
@@ -278,14 +277,13 @@ contains
     integer, intent(in) :: n_alm
     real(kind=rp), intent(in) :: f_dagger(n_alm, 3)
     
-    type(field_t), pointer :: fu, fv, fw
+    type(field_t), pointer :: fu, fv, fw, fu_local, fv_local, fw_local
     real(kind=rp) :: weight
     real(kind=rp), allocatable :: f_dagger_local(:,:)
     integer :: p, p_glb, e, n_dof
     integer :: i, j, k
-    ! integer :: rank, n, recv_size
+    integer :: temp_indices(3)
     integer :: recv_size
-    ! integer, pointer :: dof_ids(:), ids(:), p_glb_ids(:)
     integer, pointer :: p_glb_ids(:)
 
     n_dof = this%fields%item_size(1)
@@ -297,6 +295,15 @@ contains
 
     ! Only proceed with the interpolation adjoint if the calling rank has points to interpolate
     if (this%interp%n_points_local > 0) then
+
+      ! Create temporary local fields
+      call neko_scratch_registry%request_field(fu_local, temp_indices(1), .false.)
+      call neko_scratch_registry%request_field(fv_local, temp_indices(2), .false.)
+      call neko_scratch_registry%request_field(fw_local, temp_indices(3), .false.)
+
+      fu_local%x = 0.0_rp
+      fv_local%x = 0.0_rp
+      fw_local%x = 0.0_rp
 
       recv_size = this%interp%glb_intrp_comm%recv_dof(pe_rank)%size()
       
@@ -319,24 +326,30 @@ contains
                       this%interp%local_interp%weights_s(j, p) * &
                       this%interp%local_interp%weights_t(k, p)
 
-              ! write(*,'(a,i0,a,5(i0,1x),a,es16.8,a,3(es16.8,1x))') &
-              !   'rank=', pe_rank, ' (p,e,i,j,k)=', p, e, i, j, k, &
-              !   ' weight=', weight, ' xyz=', &
-              !   this%coef%dof%x(i,j,k,e), &
-              !   this%coef%dof%y(i,j,k,e), &
-              !   this%coef%dof%z(i,j,k,e)
-
-              fu%x(i, j, k, e) = fu%x(i, j, k, e) - weight * f_dagger_local(p, 1)
-              fv%x(i, j, k, e) = fv%x(i, j, k, e) - weight * f_dagger_local(p, 2)
-              fw%x(i, j, k, e) = fw%x(i, j, k, e) - weight * f_dagger_local(p, 3)
+              fu_local%x(i, j, k, e) = fu_local%x(i, j, k, e) - &
+                   weight * f_dagger_local(p, 1)
+              fv_local%x(i, j, k, e) = fv_local%x(i, j, k, e) - &
+                   weight * f_dagger_local(p, 2)
+              fw_local%x(i, j, k, e) = fw_local%x(i, j, k, e) - &
+                   weight * f_dagger_local(p, 3)
             end do
           end do
         end do
       end do
 
-      call invcol2(fu%x, this%coef%B, n_dof)
-      call invcol2(fv%x, this%coef%B, n_dof)
-      call invcol2(fw%x, this%coef%B, n_dof)
+      call invcol2(fu_local%x, this%coef%B, n_dof)
+      call invcol2(fv_local%x, this%coef%B, n_dof)
+      call invcol2(fw_local%x, this%coef%B, n_dof)
+
+      call add2(fu%x, fu_local%x, n_dof)
+      call add2(fv%x, fv_local%x, n_dof)
+      call add2(fw%x, fw_local%x, n_dof)
+
+      call neko_scratch_registry%relinquish_field(temp_indices)
+
+      ! call col2(fu%x, this%coef%mult, n_dof)
+      ! call col2(fv%x, this%coef%mult, n_dof)
+      ! call col2(fw%x, this%coef%mult, n_dof)
 
       ! Copy forcing to the device
       if (NEKO_BCKND_DEVICE .eq. 1) then
