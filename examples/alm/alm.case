@@ -1,14 +1,14 @@
 {
     "version": 1.0,
     "case": {
-        "mesh_file": "mesh/alm.nmsh",
+        "mesh_file": "data/alm/alm_b16.nmsh",
         "output_directory": "output",
         "output_boundary": false,
         "output_checkpoints": false,
         "output_at_end": true,
         "time": {
-            "end_time": 5.0,
-            "timestep": 1.25e-2,
+            "end_time": 0.3,
+            "timestep": 6.25e-3,
             "variable_timestep": false,
             "target_cfl": 0.4
         },
@@ -78,13 +78,13 @@
     "optimization": {
         "design": {
             "type": "actuator_line",
-            "N": 4,
-            "b": 3.0,
-            "eps": 0.375,
+            "N": 10,
+            "b": 2.0,
+            "eps": 0.125,
             "xcenter": 0.0,
             "ycenter": 0.0,
             "zcenter": 0.0,
-            "gamma": [0.1, 0.1, 0.1, 0.1]
+            "gamma": [0.02775, 0.04546, 0.05513, 0.06073, 0.06334, 0.06334, 0.06073, 0.05513, 0.04546, 0.02775]
         },
         "solver": {
             "type": "mma",

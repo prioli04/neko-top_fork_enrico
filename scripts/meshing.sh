@@ -42,7 +42,7 @@ function jou2nbin() {
     fi
 
     # Convert the mesh to Neko mesh format
-    $rea2nbin $input_name.re2 $input_name.nmsh
+    $rea2nbin ${mesh_file%.*}.re2 $input_name.nmsh
 
     if [[ $(find ./ -name "*.nmsh" | wc -l) -lt 1 ]]; then
         printf >&2 "\n\e[4mError:\e[0m\n"
@@ -141,7 +141,7 @@ function geo2nbin() {
     fi
 
     # Convert the mesh to Neko mesh format
-    $rea2nbin ${mesh_file%.*}.re2 $input_name.nmsh
+    $rea2nbin $input_name.re2 $input_name.nmsh
 
     if [[ $(find ./ -name "*.nmsh" | wc -l) -lt 1 ]]; then
         printf >&2 "\n\e[4mError:\e[0m\n"
@@ -176,7 +176,7 @@ function msh2nbin() {
     fi
 
     # Convert the mesh to Neko mesh format
-    $rea2nbin ${mesh_file%.*}.re2 $input_name.nmsh
+    $rea2nbin $input_name.re2 $input_name.nmsh
 
     if [[ $(find ./ -name "*.nmsh" | wc -l) -lt 1 ]]; then
         printf >&2 "\n\e[4mError:\e[0m\n"

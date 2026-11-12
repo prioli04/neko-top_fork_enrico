@@ -340,19 +340,19 @@ contains
        end do
     end if
 
-    if (present(simulation)) then
-       if (allocated(objective)) deallocate(objective)
-       allocate(augmented_lagrangian_objective_t::objective)
-       select type(ALO => objective)
-       class is (augmented_lagrangian_objective_t)
-          call json_get_or_default(parameters, &
-               "adjoint_fluid.dealias_sensitivity", dealias, .true.)
-          call ALO%init_from_attributes(design, simulation, weight = 1.0_rp, &
-               name = "Augmented Lagrangian", mask_name = "", &
-               dealias = dealias)
-       end select
-       call this%add_objective(objective)
-    end if
+   !  if (present(simulation)) then
+   !     if (allocated(objective)) deallocate(objective)
+   !     allocate(augmented_lagrangian_objective_t::objective)
+   !     select type(ALO => objective)
+   !     class is (augmented_lagrangian_objective_t)
+   !        call json_get_or_default(parameters, &
+   !             "adjoint_fluid.dealias_sensitivity", dealias, .true.)
+   !        call ALO%init_from_attributes(design, simulation, weight = 1.0_rp, &
+   !             name = "Augmented Lagrangian", mask_name = "", &
+   !             dealias = dealias)
+   !     end select
+   !     call this%add_objective(objective)
+   !  end if
 
     call neko_log%end_section()
 

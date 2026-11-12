@@ -173,7 +173,7 @@ fi
 # ============================================================================ #
 # Loop through the inputs and extract the file_list
 
-SUPPORTED_TYPES=(".jou" ".e" ".exo" ".rea" ".re2" ".geo")
+SUPPORTED_TYPES=(".jou" ".e" ".exo" ".rea" ".re2" ".geo" ".msh")
 
 file_list=""
 for input in $@; do
