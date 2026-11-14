@@ -278,6 +278,13 @@ contains
     call vcross(velinterp_ez_x, velinterp_ez_y, velinterp_ez_z, &
       u_interp%x, v_interp%x, w_interp%x, zero_vec, zero_vec, one_vec, n_alm) ! Cross product of interpolated velocities and z direction
 
+    ! Update CPU-side velocity fields
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call device_memcpy(u_adj%x, u_adj%x_d, n_dof, DEVICE_TO_HOST, .true.)
+      call device_memcpy(v_adj%x, v_adj%x_d, n_dof, DEVICE_TO_HOST, .true.)
+      call device_memcpy(w_adj%x, w_adj%x_d, n_dof, DEVICE_TO_HOST, .true.)
+    end if
+
     ! Volumetric adjoint convolution of the adjoint velocity with the gaussian kernel
     do j = 1, n_alm
       ! Usage of glsc3 needed in order to take into account the nodes in other ranks (MPI Reduce)
@@ -303,10 +310,10 @@ contains
     end if
 
     ! Take only y-component perturbations for now
+    call copy(this%sensitivity%x, grad(:, 2), this%sensitivity%size())
+
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_memcpy(grad(:, 2), this%sensitivity%x_d, n_alm, HOST_TO_DEVICE, sync=.true.)
-    else
-       call copy(this%sensitivity%x, grad(:, 2), this%sensitivity%size())
+       call device_memcpy(this%sensitivity%x, this%sensitivity%x_d, n_alm, HOST_TO_DEVICE, sync=.true.)
     end if
 
   end subroutine drag_lift_deviation_update_sensitivity

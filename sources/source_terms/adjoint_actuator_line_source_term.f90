@@ -48,6 +48,7 @@ module adjoint_actuator_line_source_term
   use vector, only: vector_t
   use matrix, only : matrix_t
   use device, only : device_memcpy, HOST_TO_DEVICE, DEVICE_TO_HOST
+  use device_math, only : device_add2
   use math, only : vcross, glsc3, pi, invcol2, glmax, add2s2, col2, add2
   use comm, only: pe_rank
   implicit none
@@ -201,12 +202,19 @@ contains
     zero_vec = 0.0_rp
     one_vec = 1.0_rp
 
+    ! Update CPU-side velocity fields
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call device_memcpy(this%u_adj%x, this%u_adj%x_d, n_dof, DEVICE_TO_HOST, .true.)
+      call device_memcpy(this%v_adj%x, this%v_adj%x_d, n_dof, DEVICE_TO_HOST, .true.)
+      call device_memcpy(this%w_adj%x, this%w_adj%x_d, n_dof, DEVICE_TO_HOST, .true.)
+    end if
+
     ! Volumetric adjoint convolution of the adjoint velocity with the gaussian kernel
     do j = 1, n_alm
       ! Usage of glsc3 needed in order to take into account the nodes in other ranks (MPI Reduce)
-      conv_x(j) = glsc3(this%u_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
-      conv_y(j) = glsc3(this%v_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
-      conv_z(j) = glsc3(this%w_adj%x(:,1,1,1), this%kernel_volume%x(:,j), this%coef%B, n_dof)
+      conv_x(j) = glsc3(this%u_adj%x, this%kernel_volume%x(:,j), this%coef%B, n_dof)
+      conv_y(j) = glsc3(this%v_adj%x, this%kernel_volume%x(:,j), this%coef%B, n_dof)
+      conv_z(j) = glsc3(this%w_adj%x, this%kernel_volume%x(:,j), this%coef%B, n_dof)
     end do 
 
     ! Compute adjoint point forcing
@@ -341,22 +349,27 @@ contains
       call invcol2(fv_local%x, this%coef%B, n_dof)
       call invcol2(fw_local%x, this%coef%B, n_dof)
 
-      call add2(fu%x, fu_local%x, n_dof)
-      call add2(fv%x, fv_local%x, n_dof)
-      call add2(fw%x, fw_local%x, n_dof)
+      ! Add to shared forcing field
+      if (NEKO_BCKND_DEVICE .eq. 1) then
+        call device_memcpy(fu_local%x, fu_local%x_d, n_dof, HOST_TO_DEVICE, .true.)
+        call device_memcpy(fv_local%x, fv_local%x_d, n_dof, HOST_TO_DEVICE, .true.)
+        call device_memcpy(fw_local%x, fw_local%x_d, n_dof, HOST_TO_DEVICE, .true.)
+
+        call device_add2(fu%x_d, fu_local%x_d, n_dof)
+        call device_add2(fv%x_d, fv_local%x_d, n_dof)
+        call device_add2(fw%x_d, fw_local%x_d, n_dof)
+
+      else 
+        call add2(fu%x, fu_local%x, n_dof)
+        call add2(fv%x, fv_local%x, n_dof)
+        call add2(fw%x, fw_local%x, n_dof)
+      end if
 
       call neko_scratch_registry%relinquish_field(temp_indices)
 
       ! call col2(fu%x, this%coef%mult, n_dof)
       ! call col2(fv%x, this%coef%mult, n_dof)
       ! call col2(fw%x, this%coef%mult, n_dof)
-
-      ! Copy forcing to the device
-      if (NEKO_BCKND_DEVICE .eq. 1) then
-        call device_memcpy(fu%x, fu%x_d, n_dof, HOST_TO_DEVICE, .true.)
-        call device_memcpy(fv%x, fv%x_d, n_dof, HOST_TO_DEVICE, .true.)
-        call device_memcpy(fw%x, fw%x_d, n_dof, HOST_TO_DEVICE, .true.)
-      end if
     end if
 
   end subroutine adjoint_interpolation_compute

@@ -41,6 +41,7 @@ module actuator_line_design
   use json_module, only: json_file
   use adjoint_fluid_pnpn, only: adjoint_fluid_pnpn_t
   use registry, only : neko_registry
+  use neko_config, only: NEKO_BCKND_DEVICE
   use design, only: design_t
   use simulation_m, only: simulation_t
   use actuator_line_source_term, only: actuator_line_source_term_t, make_registry_name
@@ -260,6 +261,10 @@ contains
 
     values%x = gamma_ptr%x
 
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call device_memcpy(values%x, values%x_d, this%size(), HOST_TO_DEVICE, .true.)
+    end if
+
   end subroutine actuator_line_design_get_design
 
   subroutine actuator_line_design_get_gamma(this, gamma_ptr)
@@ -367,6 +372,10 @@ contains
 
     if (gamma_ptr%size() .ne. values%size()) then
        call neko_error('Update design: size mismatch')
+    end if
+
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+      call device_memcpy(values%x, values%x_d, this%size(), DEVICE_TO_HOST, .true.)
     end if
 
     gamma_ptr%x = values%x
